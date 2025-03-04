@@ -131,7 +131,8 @@ from openinference.semconv.trace import (
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-LLAMA_INDEX_VERSION = tuple(map(int, version("llama-index-core").split(".")[:3]))
+LLAMA_INDEX_VERSION = tuple(
+    map(int, version("llama-index-core").split(".")[:3]))
 
 STREAMING_FINISHED_EVENTS = (
     LLMChatEndEvent,
@@ -204,7 +205,8 @@ class _Span(BaseSpan):
             # Follow the format in OTEL SDK for description, see:
             # https://github.com/open-telemetry/opentelemetry-python/blob/2b9dcfc5d853d1c10176937a6bcaade54cda1a31/opentelemetry-api/src/opentelemetry/trace/__init__.py#L588  # noqa E501
             description = f"{type(exception).__name__}: {exception}"
-            status = Status(status_code=StatusCode.ERROR, description=description)
+            status = Status(status_code=StatusCode.ERROR,
+                            description=description)
         self[OPENINFERENCE_SPAN_KIND] = self._span_kind or CHAIN
         self._otel_span.set_status(status=status)
         self._otel_span.set_attributes(self._attributes)
@@ -224,7 +226,8 @@ class _Span(BaseSpan):
 
     def process_input(self, instance: Any, bound_args: inspect.BoundArguments) -> None:
         try:
-            self[INPUT_VALUE] = safe_json_dumps(bound_args.arguments, cls=_Encoder)
+            self[INPUT_VALUE] = safe_json_dumps(
+                bound_args.arguments, cls=_Encoder)
             self[INPUT_MIME_TYPE] = JSON
         except BaseException as e:
             logger.exception(str(e))
@@ -250,7 +253,8 @@ class _Span(BaseSpan):
         elif isinstance(result, BaseModel):
             _ensure_result_model_is_serializable(result)
             try:
-                self[OUTPUT_VALUE] = result.model_dump_json(exclude_unset=True)
+                self[OUTPUT_VALUE] = result.model_dump_json(
+                    exclude_unset=True, exclude={"retriever"})
                 self[OUTPUT_MIME_TYPE] = JSON
             except BaseException as e:
                 logger.exception(str(e))
@@ -301,7 +305,8 @@ class _Span(BaseSpan):
         elif isinstance(event, STREAMING_IN_PROGRESS_EVENTS):
             if self._first_token_timestamp is None:
                 timestamp = time_ns()
-                self._otel_span.add_event("First Token Stream Event", timestamp=timestamp)
+                self._otel_span.add_event(
+                    "First Token Stream Event", timestamp=timestamp)
                 self._first_token_timestamp = timestamp
             self._last_updated_at = time()
             self.notify_parent(_StreamingStatus.IN_PROGRESS)
@@ -320,7 +325,8 @@ class _Span(BaseSpan):
 
     @singledispatchmethod
     def _process_event(self, event: BaseEvent) -> None:
-        logger.warning(f"Unhandled event of type {event.__class__.__qualname__}")
+        logger.warning(
+            f"Unhandled event of type {event.__class__.__qualname__}")
 
     @_process_event.register
     def _(self, event: ExceptionEvent) -> None: ...
@@ -404,7 +410,8 @@ class _Span(BaseSpan):
             if (argument_value := argument_values.get(variable_name)) is not None
         }
         if template_arguments:
-            self[LLM_PROMPT_TEMPLATE_VARIABLES] = safe_json_dumps(template_arguments)
+            self[LLM_PROMPT_TEMPLATE_VARIABLES] = safe_json_dumps(
+                template_arguments)
 
     @_process_event.register
     def _(self, event: LLMPredictEndEvent) -> None:
@@ -559,7 +566,8 @@ class _Span(BaseSpan):
             if (score := node.get_score()) is not None:
                 self[f"{prefix}.{i}.{DOCUMENT_SCORE}"] = score
             if metadata := node.metadata:
-                self[f"{prefix}.{i}.{DOCUMENT_METADATA}"] = safe_json_dumps(metadata)
+                self[f"{prefix}.{i}.{DOCUMENT_METADATA}"] = safe_json_dumps(
+                    metadata)
 
     def _process_messages(
         self,
@@ -594,8 +602,10 @@ class _Span(BaseSpan):
             self[INPUT_VALUE] = query
             self._attributes.pop(INPUT_MIME_TYPE, None)
         elif isinstance(query, QueryBundle):
-            query_dict = {k: v for k, v in query.to_dict().items() if v is not None}
-            query_dict.pop("embedding", None)  # because it takes up too much space
+            query_dict = {k: v for k, v in query.to_dict().items()
+                          if v is not None}
+            # because it takes up too much space
+            query_dict.pop("embedding", None)
             if len(query_dict) == 1 and query.query_str:
                 self[INPUT_VALUE] = query.query_str
                 self._attributes.pop(INPUT_MIME_TYPE, None)
@@ -732,7 +742,8 @@ class _SpanHandler(BaseSpanHandler[_Span], extra="allow"):
         if context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY):
             return None
         with self.lock:
-            parent = self.open_spans.get(parent_span_id) if parent_span_id else None
+            parent = self.open_spans.get(
+                parent_span_id) if parent_span_id else None
         otel_span = self._otel_tracer.start_span(
             name=id_.partition("-")[0],
             start_time=time_ns(),
@@ -816,12 +827,14 @@ class EventHandler(BaseEventHandler, extra="allow"):
         if span is None:
             span = self._span_handler._export_queue.find(event.span_id)
         if span is None:
-            logger.warning(f"Open span is missing for {event.span_id=}, {event.id_=}")
+            logger.warning(
+                f"Open span is missing for {event.span_id=}, {event.id_=}")
         else:
             try:
                 span.process_event(event)
             except Exception:
-                logger.exception(f"Error processing event of type {event.__class__.__qualname__}")
+                logger.exception(
+                    f"Error processing event of type {event.__class__.__qualname__}")
                 pass
         return event
 
@@ -929,7 +942,7 @@ def _(_: BaseTool) -> str:
 class _Encoder(json.JSONEncoder):
     def __init__(self, **kwargs: Any) -> None:
         kwargs.pop("default", None)
-        super().__init__()
+        super().__init__(ensure_ascii=False)
 
     def default(self, obj: Any) -> Any:
         return _encoder(obj)
