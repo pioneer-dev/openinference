@@ -27,18 +27,18 @@ dependencies = [
   "opentelemetry-api",
   "opentelemetry-instrumentation",
   "opentelemetry-semantic-conventions",
-  "openinference-instrumentation>=0.1.20",
-  "openinference-semantic-conventions",
+  "openinference-instrumentation>=0.1.27",
+  "openinference-semantic-conventions>=0.1.17",
   "wrapt",
   "typing-extensions",
 ]
 
 [project.optional-dependencies]
 instruments = [
-  "smolagents>=1.6.0",
+  "smolagents>=1.21.2",
 ]
 test = [
-  "smolagents>=1.2.2",
+  "smolagents[litellm]==1.21.2",
   "opentelemetry-sdk",
   "pytest-recording",
   "openai",

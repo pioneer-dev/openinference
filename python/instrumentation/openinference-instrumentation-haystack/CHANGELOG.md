@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.1.24](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-haystack-v0.1.23...python-openinference-instrumentation-haystack-v0.1.24) (2025-05-30)
+
+
+### Bug Fixes
+
+* CI Failures For Haystack ([#1736](https://github.com/Arize-ai/openinference/issues/1736)) ([673dc40](https://github.com/Arize-ai/openinference/commit/673dc4071845aa3282f9516de6a57d4c92790240))
+
+## [0.1.23](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-haystack-v0.1.22...python-openinference-instrumentation-haystack-v0.1.23) (2025-05-13)
+
+
+### Bug Fixes
+
+* **haystack:** fixing ci issues for haystack-ai ([#1623](https://github.com/Arize-ai/openinference/issues/1623)) ([daffa8e](https://github.com/Arize-ai/openinference/commit/daffa8e3fa9825daa76268a91a208b8c77dd1cb1))
+
+## [0.1.22](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-haystack-v0.1.21...python-openinference-instrumentation-haystack-v0.1.22) (2025-05-11)
+
+
+### Bug Fixes
+
+* ruff formating fix & bump ruff version in dev requirements ([#1600](https://github.com/Arize-ai/openinference/issues/1600)) ([076bb79](https://github.com/Arize-ai/openinference/commit/076bb7966d44fccdb2ab94e6f379ef4ae22c39b1))
+
+## [0.1.21](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-haystack-v0.1.20...python-openinference-instrumentation-haystack-v0.1.21) (2025-04-28)
+
+
+### Bug Fixes
+
+* update lower bound on openinference-semantic-conventions ([#1567](https://github.com/Arize-ai/openinference/issues/1567)) ([c2f428c](https://github.com/Arize-ai/openinference/commit/c2f428c5916c3dd62cf6670358f37111d4f7fd25))
+
+## [0.1.20](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-haystack-v0.1.19...python-openinference-instrumentation-haystack-v0.1.20) (2025-04-11)
+
+
+### Bug Fixes
+
+* increased minimum supported version of openinference-instrumentation to 0.1.27 ([#1507](https://github.com/Arize-ai/openinference/issues/1507)) ([a55edfa](https://github.com/Arize-ai/openinference/commit/a55edfa8900c1f36a73385c7d03f91cffadd85c4))
+
+## [0.1.19](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-haystack-v0.1.18...python-openinference-instrumentation-haystack-v0.1.19) (2025-03-14)
+
+
+### Documentation
+
+* fix license to be openinference ([#1353](https://github.com/Arize-ai/openinference/issues/1353)) ([85d435b](https://github.com/Arize-ai/openinference/commit/85d435be3af3de5424494cfbdd654454688b7377))
+
 ## [0.1.18](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-haystack-v0.1.17...python-openinference-instrumentation-haystack-v0.1.18) (2025-02-22)
 
 

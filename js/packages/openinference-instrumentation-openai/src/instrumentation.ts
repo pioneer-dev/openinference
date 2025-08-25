@@ -1,4 +1,4 @@
-import * as openai from "openai";
+import openai, { APIPromise } from "openai";
 import {
   InstrumentationBase,
   InstrumentationConfig,
@@ -14,6 +14,8 @@ import {
   Attributes,
   SpanStatusCode,
   Span,
+  TracerProvider,
+  Tracer,
 } from "@opentelemetry/api";
 import { VERSION } from "./version";
 import {
@@ -45,8 +47,22 @@ import {
   safelyJSONStringify,
   TraceConfigOptions,
 } from "@arizeai/openinference-core";
+import {
+  ResponseCreateParamsBase,
+  ResponseStreamEvent,
+  Response as ResponseType,
+} from "openai/resources/responses/responses";
+
+import {
+  consumeResponseStreamEvents,
+  getResponsesInputMessagesAttributes,
+  getResponsesOutputMessagesAttributes,
+  getResponsesUsageAttributes,
+} from "./responsesAttributes";
 
 const MODULE_NAME = "openai";
+
+const INSTRUMENTATION_NAME = "@arizeai/openinference-instrumentation-openai";
 
 /**
  * Flag to check if the openai module has been patched
@@ -78,6 +94,69 @@ function getExecContext(span: Span) {
   }
   return execContext;
 }
+
+/**
+ * Gets the appropriate LLM provider based on the OpenAI client instance
+ * Follows the same logic as the Python implementation by checking the baseURL host
+ * @param clientInstance The OpenAI client instance
+ * @returns LLMProvider.AZURE for Azure OpenAI, LLMProvider.OPENAI for regular OpenAI
+ */
+function getLLMProvider(clientInstance: unknown): LLMProvider {
+  try {
+    // The clientInstance might be a sub-object (like Completions) that has a _client property
+    // pointing to the actual OpenAI/AzureOpenAI client
+    const instance = clientInstance as {
+      baseURL?: string | { host?: string };
+      _client?: {
+        baseURL?: string | { host?: string };
+      };
+    };
+
+    let host: string | undefined;
+    let baseURL: string | { host?: string } | undefined;
+
+    // First try to get baseURL from the instance itself
+    if (instance.baseURL) {
+      baseURL = instance.baseURL;
+    }
+    // If not found, try the _client property (this is where Azure OpenAI stores it)
+    else if (instance._client?.baseURL) {
+      baseURL = instance._client.baseURL;
+    }
+
+    if (typeof baseURL === "string") {
+      // Extract host from URL string
+      try {
+        const url = new URL(baseURL);
+        host = url.hostname;
+      } catch {
+        // If URL parsing fails, fallback to string matching
+        host = baseURL;
+      }
+    } else if (baseURL && typeof baseURL === "object" && "host" in baseURL) {
+      // Direct host property
+      host = baseURL.host;
+    }
+
+    if (host && typeof host === "string") {
+      // Follow the same pattern as Python implementation
+      if (host.includes("api.openai.com")) {
+        return LLMProvider.OPENAI;
+      } else if (host.includes("openai.azure.com")) {
+        return LLMProvider.AZURE;
+      } else if (host.includes("api.microsoft.com")) {
+        // Additional Azure endpoint pattern
+        return LLMProvider.AZURE;
+      }
+    }
+  } catch (error) {
+    // If we can't determine, default to regular OpenAI
+    diag.debug("Failed to determine LLM provider from instance", error);
+  }
+
+  // Default to OpenAI if we can't determine
+  return LLMProvider.OPENAI;
+}
 /**
  * An auto instrumentation class for OpenAI that creates {@link https://github.com/Arize-ai/openinference/blob/main/spec/semantic_conventions.md|OpenInference} Compliant spans for the OpenAI API
  * @param instrumentationConfig The config for the instrumentation @see {@link InstrumentationConfig}
@@ -85,9 +164,12 @@ function getExecContext(span: Span) {
  */
 export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
   private oiTracer: OITracer;
+  private tracerProvider?: TracerProvider;
+  private traceConfig?: TraceConfigOptions;
   constructor({
     instrumentationConfig,
     traceConfig,
+    tracerProvider,
   }: {
     /**
      * The config for the instrumentation
@@ -99,19 +181,33 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
      * @see {@link TraceConfigOptions}
      */
     traceConfig?: TraceConfigOptions;
+    /**
+     * An optional custom trace provider to be used for tracing. If not provided, a tracer will be created using the global tracer provider.
+     * This is useful if you want to use a non-global tracer provider.
+     *
+     * @see {@link TracerProvider}
+     */
+    tracerProvider?: TracerProvider;
   } = {}) {
     super(
-      "@arizeai/openinference-instrumentation-openai",
+      INSTRUMENTATION_NAME,
       VERSION,
       Object.assign({}, instrumentationConfig),
     );
-    this.oiTracer = new OITracer({ tracer: this.tracer, traceConfig });
+    this.tracerProvider = tracerProvider;
+    this.traceConfig = traceConfig;
+    this.oiTracer = new OITracer({
+      tracer:
+        this.tracerProvider?.getTracer(INSTRUMENTATION_NAME, VERSION) ??
+        this.tracer,
+      traceConfig,
+    });
   }
 
   protected init(): InstrumentationModuleDefinition<typeof openai> {
     const module = new InstrumentationNodeModuleDefinition<typeof openai>(
       "openai",
-      ["^4.0.0"],
+      ["^5.0.0"],
       this.patch.bind(this),
       this.unpatch.bind(this),
     );
@@ -125,6 +221,25 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
   manuallyInstrument(module: typeof openai) {
     diag.debug(`Manually instrumenting ${MODULE_NAME}`);
     this.patch(module);
+  }
+
+  get tracer(): Tracer {
+    if (this.tracerProvider) {
+      return this.tracerProvider.getTracer(
+        this.instrumentationName,
+        this.instrumentationVersion,
+      );
+    }
+    return super.tracer;
+  }
+
+  setTracerProvider(tracerProvider: TracerProvider): void {
+    super.setTracerProvider(tracerProvider);
+    this.tracerProvider = tracerProvider;
+    this.oiTracer = new OITracer({
+      tracer: this.tracer,
+      traceConfig: this.traceConfig,
+    });
   }
 
   /**
@@ -141,10 +256,10 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const instrumentation: OpenAIInstrumentation = this;
 
+    // Patch create chat completions
     type ChatCompletionCreateType =
       typeof module.OpenAI.Chat.Completions.prototype.create;
 
-    // Patch create chat completions
     this._wrap(
       module.OpenAI.Chat.Completions.prototype,
       "create",
@@ -169,16 +284,14 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
                 [SemanticConventions.LLM_INVOCATION_PARAMETERS]:
                   JSON.stringify(invocationParameters),
                 [SemanticConventions.LLM_SYSTEM]: LLMSystem.OPENAI,
-                [SemanticConventions.LLM_PROVIDER]: LLMProvider.OPENAI,
+                [SemanticConventions.LLM_PROVIDER]: getLLMProvider(this),
                 ...getLLMInputMessagesAttributes(body),
                 ...getLLMToolsJSONSchema(body),
               },
             },
           );
           const execContext = getExecContext(span);
-          const execPromise = safeExecuteInTheMiddle<
-            ReturnType<ChatCompletionCreateType>
-          >(
+          const execPromise = safeExecuteInTheMiddle(
             () => {
               return context.with(trace.setSpan(execContext, span), () => {
                 return original.apply(this, args);
@@ -196,7 +309,12 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
               }
             },
           );
-          const wrappedPromise = execPromise.then((result) => {
+
+          const wrappedPromiseThen = (
+            result:
+              | Stream<openai.Chat.Completions.ChatCompletionChunk>
+              | openai.Chat.Completions.ChatCompletion,
+          ) => {
             if (isChatCompletionResponse(result)) {
               // Record the results
               span.setAttributes({
@@ -219,7 +337,11 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
             }
 
             return result;
-          });
+          };
+          const wrappedPromise = invokeMaybeAPIPromise(
+            execPromise,
+            wrappedPromiseThen,
+          );
           return context.bind(execContext, wrappedPromise);
         };
       },
@@ -251,16 +373,14 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
                 [SemanticConventions.LLM_INVOCATION_PARAMETERS]:
                   JSON.stringify(invocationParameters),
                 [SemanticConventions.LLM_SYSTEM]: LLMSystem.OPENAI,
-                [SemanticConventions.LLM_PROVIDER]: LLMProvider.OPENAI,
+                [SemanticConventions.LLM_PROVIDER]: getLLMProvider(this),
                 ...getCompletionInputValueAndMimeType(body),
               },
             },
           );
           const execContext = getExecContext(span);
 
-          const execPromise = safeExecuteInTheMiddle<
-            ReturnType<CompletionsCreateType>
-          >(
+          const execPromise = safeExecuteInTheMiddle(
             () => {
               return context.with(trace.setSpan(execContext, span), () => {
                 return original.apply(this, args);
@@ -278,7 +398,9 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
               }
             },
           );
-          const wrappedPromise = execPromise.then((result) => {
+          const wrappedPromiseThen = (
+            result: Completion | Stream<Completion>,
+          ) => {
             if (isCompletionResponse(result)) {
               // Record the results
               span.setAttributes({
@@ -293,7 +415,11 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
               span.end();
             }
             return result;
-          });
+          };
+          const wrappedPromise = invokeMaybeAPIPromise(
+            execPromise,
+            wrappedPromiseThen,
+          );
           return context.bind(execContext, wrappedPromise);
         };
       },
@@ -326,13 +452,12 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
               [SemanticConventions.INPUT_MIME_TYPE]: isStringInput
                 ? MimeType.TEXT
                 : MimeType.JSON,
+              [SemanticConventions.LLM_PROVIDER]: getLLMProvider(this),
               ...getEmbeddingTextAttributes(body),
             },
           });
           const execContext = getExecContext(span);
-          const execPromise = safeExecuteInTheMiddle<
-            ReturnType<EmbeddingsCreateType>
-          >(
+          const execPromise = safeExecuteInTheMiddle(
             () => {
               return context.with(trace.setSpan(execContext, span), () => {
                 return original.apply(this, args);
@@ -350,7 +475,7 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
               }
             },
           );
-          const wrappedPromise = execPromise.then((result) => {
+          const wrappedPromiseThen = (result: CreateEmbeddingResponse) => {
             if (result) {
               // Record the results
               span.setAttributes({
@@ -361,11 +486,115 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
             span.setStatus({ code: SpanStatusCode.OK });
             span.end();
             return result;
-          });
+          };
+          const wrappedPromise = invokeMaybeAPIPromise(
+            execPromise,
+            wrappedPromiseThen,
+          );
           return context.bind(execContext, wrappedPromise);
         };
       },
     );
+
+    // Patch responses (if the patched module contains the Responses interface)
+    if (module.OpenAI.Responses) {
+      type ResponsesCreateType =
+        typeof module.OpenAI.Responses.prototype.create;
+
+      this._wrap(
+        module.OpenAI.Responses.prototype,
+        "create",
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (original: ResponsesCreateType): any => {
+          return function patchedCreate(
+            this: unknown,
+            ...args: Parameters<ResponsesCreateType>
+          ) {
+            const body = args[0];
+            const { input: _messages, ...invocationParameters } = body;
+            const span = instrumentation.oiTracer.startSpan(
+              `OpenAI Responses`,
+              {
+                kind: SpanKind.INTERNAL,
+                attributes: {
+                  [SemanticConventions.OPENINFERENCE_SPAN_KIND]:
+                    OpenInferenceSpanKind.LLM,
+                  [SemanticConventions.LLM_MODEL_NAME]: body.model,
+                  [SemanticConventions.INPUT_VALUE]: JSON.stringify(body),
+                  [SemanticConventions.INPUT_MIME_TYPE]: MimeType.JSON,
+                  [SemanticConventions.LLM_INVOCATION_PARAMETERS]:
+                    JSON.stringify(invocationParameters),
+                  [SemanticConventions.LLM_SYSTEM]: LLMSystem.OPENAI,
+                  [SemanticConventions.LLM_PROVIDER]: getLLMProvider(this),
+                  ...getResponsesInputMessagesAttributes(body),
+                  ...getLLMToolsJSONSchema(body),
+                },
+              },
+            );
+            const execContext = getExecContext(span);
+            const execPromise = safeExecuteInTheMiddle(
+              () => {
+                return context.with(trace.setSpan(execContext, span), () => {
+                  return original.apply(this, args);
+                });
+              },
+              (error) => {
+                // Push the error to the span
+                if (error) {
+                  span.recordException(error);
+                  span.setStatus({
+                    code: SpanStatusCode.ERROR,
+                    message: error.message,
+                  });
+                  span.end();
+                }
+              },
+            );
+            const wrappedPromiseThen = (
+              result: Stream<ResponseStreamEvent> | ResponseType,
+            ) => {
+              const recordSpan = (result?: ResponseType) => {
+                if (!result) {
+                  span.setStatus({ code: SpanStatusCode.ERROR });
+                  span.end();
+                  return;
+                }
+                span.setAttributes({
+                  [SemanticConventions.OUTPUT_VALUE]: JSON.stringify(result),
+                  [SemanticConventions.OUTPUT_MIME_TYPE]: MimeType.JSON,
+                  // Override the model from the value sent by the server
+                  [SemanticConventions.LLM_MODEL_NAME]: result.model,
+                  ...getResponsesOutputMessagesAttributes(result),
+                  ...getResponsesUsageAttributes(result),
+                });
+                span.setStatus({ code: SpanStatusCode.OK });
+                span.end();
+              };
+              if (isResponseCreateResponse(result)) {
+                // Record the results, as we have the final result
+                recordSpan(result);
+              } else {
+                // This is a streaming response
+                // First split the stream via tee
+                const [leftStream, rightStream] = result.tee();
+                // take the right stream, consuming it and then recording the final chunk
+                // into the span
+                consumeResponseStreamEvents(rightStream).then(recordSpan);
+                // give the left stream back to the caller
+                result = leftStream;
+              }
+
+              return result;
+            };
+            const wrappedPromise = invokeMaybeAPIPromise(
+              execPromise,
+              wrappedPromiseThen,
+            );
+            return context.bind(execContext, wrappedPromise);
+          };
+        },
+      );
+    }
 
     _isOpenInferencePatched = true;
     try {
@@ -397,6 +626,12 @@ export class OpenAIInstrumentation extends InstrumentationBase<typeof openai> {
       diag.warn(`Failed to unset ${MODULE_NAME} patched flag on the module`, e);
     }
   }
+}
+
+function isResponseCreateResponse(
+  response: Stream<ResponseStreamEvent> | ResponseType,
+): response is ResponseType {
+  return "object" in response && response.object === "response";
 }
 
 /**
@@ -449,7 +684,7 @@ function getLLMInputMessagesAttributes(
  * Converts each tool definition into a json schema
  */
 function getLLMToolsJSONSchema(
-  body: ChatCompletionCreateParamsBase,
+  body: ChatCompletionCreateParamsBase | ResponseCreateParamsBase,
 ): Attributes {
   if (!body.tools) {
     // If tools is undefined, return an empty object
@@ -490,7 +725,7 @@ function getChatCompletionInputMessageAttributes(
           `${contentsIndexPrefix}${SemanticConventions.MESSAGE_CONTENT_TYPE}`
         ] = "image";
         attributes[
-          `${contentsIndexPrefix}${SemanticConventions.MESSAGE_CONTENT_IMAGE}`
+          `${contentsIndexPrefix}${SemanticConventions.MESSAGE_CONTENT_IMAGE}.${SemanticConventions.IMAGE_URL}`
         ] = part.image_url.url;
       }
     });
@@ -534,6 +769,9 @@ function getChatCompletionInputMessageAttributes(
     case "system":
       // There's nothing to add for the system. Content is captured above
       break;
+    case "developer":
+      // There's nothing to add for the developer. Content is captured above
+      break;
     default:
       assertUnreachable(role);
       break;
@@ -573,14 +811,23 @@ function getUsageAttributes(
   completion: ChatCompletion | Completion,
 ): Attributes {
   if (completion.usage) {
-    return {
+    const usageAttributes: Attributes = {
       [SemanticConventions.LLM_TOKEN_COUNT_COMPLETION]:
         completion.usage.completion_tokens,
       [SemanticConventions.LLM_TOKEN_COUNT_PROMPT]:
         completion.usage.prompt_tokens,
       [SemanticConventions.LLM_TOKEN_COUNT_TOTAL]:
         completion.usage.total_tokens,
+      [SemanticConventions.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ]:
+        completion.usage.prompt_tokens_details?.cached_tokens,
+      [SemanticConventions.LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO]:
+        completion.usage.prompt_tokens_details?.audio_tokens,
+      [SemanticConventions.LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO]:
+        completion.usage.completion_tokens_details?.audio_tokens,
+      [SemanticConventions.LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING]:
+        completion.usage.completion_tokens_details?.reasoning_tokens,
     };
+    return usageAttributes;
   }
   return {};
 }
@@ -798,4 +1045,47 @@ function getToolAndFunctionCallAttributesFromStreamChunk(
       choice.delta.function_call.arguments;
   }
   return attributes;
+}
+
+/**
+ * Type-guard that checks if the promise is an APIPromise.
+ *
+ * APIPromise is a class from openai that wraps promises with special behavior.
+ *
+ * @param promise - The promise to check
+ * @returns True if the promise is an APIPromise, false otherwise
+ */
+function isAPIPromise<T>(promise: unknown): promise is APIPromise<T> {
+  return promise instanceof APIPromise;
+}
+
+/**
+ * Invokes the thennable of a promise or an APIPromise.
+ *
+ * This is necessary to safely invoke promises returned by openai sdk methods.
+ *
+ * Without this wrapper, instrumentation will "consume" returned APIPromise instances,
+ * Making them unusable by other openai sdk methods, such as when completions.parse internally
+ * calls completions.create, expecting an APIPromise which we would otherwise consume by calling `then` on it.
+ *
+ * @param promise - The promise to invoke the thennable of
+ * @param then - The thennable to invoke
+ * @returns The promise with the thennable invoked
+ */
+function invokeMaybeAPIPromise<T>(
+  promise: T,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  then: (value: any) => unknown,
+): T {
+  if (isAPIPromise<T>(promise)) {
+    return promise._thenUnwrap(then) as T;
+  } else if (promise instanceof Promise) {
+    return promise.then(then) as T;
+  } else {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "Promise is not an APIPromise or a regular promise, cannot instrument.",
+    );
+    return promise;
+  }
 }

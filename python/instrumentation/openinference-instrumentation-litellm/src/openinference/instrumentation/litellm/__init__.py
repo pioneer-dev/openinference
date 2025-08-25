@@ -9,6 +9,7 @@ from typing import (
     Iterable,
     Iterator,
     Mapping,
+    Optional,
     Tuple,
     TypeVar,
     Union,
@@ -23,17 +24,13 @@ from opentelemetry.util.types import AttributeValue
 
 import litellm
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
-from litellm.types.utils import (
-    Choices,
-    EmbeddingResponse,
-    ImageResponse,
-    Message,
-    ModelResponse,
-)
+from litellm.types.utils import Choices, EmbeddingResponse, ImageResponse, ModelResponse
+from litellm.types.utils import Message as LitellmMessage
 from openinference.instrumentation import (
     OITracer,
     TraceConfig,
     get_attributes_from_context,
+    get_llm_provider_attributes,
     safe_json_dumps,
 )
 from openinference.instrumentation.litellm.package import _instruments
@@ -43,15 +40,46 @@ from openinference.semconv.trace import (
     ImageAttributes,
     MessageAttributes,
     MessageContentAttributes,
+    OpenInferenceLLMProviderValues,
+    OpenInferenceMimeTypeValues,
     OpenInferenceSpanKindValues,
     SpanAttributes,
+    ToolAttributes,
+    ToolCallAttributes,
 )
+
+# Skip capture
+KEYS_TO_REDACT = ["api_key", "messages"]
 
 
 # Helper functions to set span attributes
 def _set_span_attribute(span: trace_api.Span, name: str, value: AttributeValue) -> None:
     if value is not None and value != "":
         span.set_attribute(name, value)
+
+
+_LITELLM_TO_OPENINFERENCE_PROVIDERS = {
+    "openai": OpenInferenceLLMProviderValues.OPENAI,
+    "anthropic": OpenInferenceLLMProviderValues.ANTHROPIC,
+    "cohere": OpenInferenceLLMProviderValues.COHERE,
+    "mistral": OpenInferenceLLMProviderValues.MISTRALAI,
+    "vertex_ai": OpenInferenceLLMProviderValues.GOOGLE,
+    "gemini": OpenInferenceLLMProviderValues.GOOGLE,
+    "azure": OpenInferenceLLMProviderValues.AZURE,
+    "bedrock": OpenInferenceLLMProviderValues.AWS,
+    "xai": OpenInferenceLLMProviderValues.XAI,
+    "deepseek": OpenInferenceLLMProviderValues.DEEPSEEK,
+}
+
+
+def _get_oi_provider_from_litellm_model_name(
+    model_name: str,
+) -> Optional[OpenInferenceLLMProviderValues]:
+    try:
+        _, litellm_provider, _, _ = litellm.get_llm_provider(model=model_name)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    return _LITELLM_TO_OPENINFERENCE_PROVIDERS.get(litellm_provider)
 
 
 T = TypeVar("T", bound=type)
@@ -61,8 +89,22 @@ def is_iterable_of(lst: Iterable[object], tp: T) -> bool:
     return isinstance(lst, Iterable) and all(isinstance(x, tp) for x in lst)
 
 
+def _set_output_message_value(span: trace_api.Span, result: ModelResponse) -> Any:
+    if (
+        result.choices
+        and isinstance(result.choices[-1], Choices)
+        and (output_value := result.choices[-1].message.content)
+    ):
+        _set_span_attribute(span, SpanAttributes.OUTPUT_VALUE, output_value)
+    else:
+        _set_span_attribute(span, SpanAttributes.OUTPUT_VALUE, result.model_dump_json())
+        _set_span_attribute(
+            span, SpanAttributes.OUTPUT_MIME_TYPE, OpenInferenceMimeTypeValues.JSON.value
+        )
+
+
 def _get_attributes_from_message_param(
-    message: Union[Mapping[str, Any], Message],
+    message: Union[Mapping[str, Any], LitellmMessage],
 ) -> Iterator[Tuple[str, AttributeValue]]:
     if not hasattr(message, "get"):
         return
@@ -79,6 +121,21 @@ def _get_attributes_from_message_param(
             for index, c in list(enumerate(content)):
                 for key, value in _get_attributes_from_message_content(c):
                     yield f"{MessageAttributes.MESSAGE_CONTENTS}.{index}.{key}", value
+
+    if tool_calls := message.get("tool_calls"):
+        if isinstance(tool_calls, Iterable):
+            for tool_call_index, tool_call in enumerate(tool_calls):
+                if function := tool_call.get("function"):
+                    if function_name := function.get("name"):
+                        yield (
+                            f"{MessageAttributes.MESSAGE_TOOL_CALLS}.{tool_call_index}.{ToolCallAttributes.TOOL_CALL_FUNCTION_NAME}",
+                            function_name,
+                        )
+                    if function_arguments := function.get("arguments"):
+                        yield (
+                            f"{MessageAttributes.MESSAGE_TOOL_CALLS}.{tool_call_index}.{ToolCallAttributes.TOOL_CALL_FUNCTION_ARGUMENTS_JSON}",
+                            function_arguments,
+                        )
 
 
 def _get_attributes_from_message_content(
@@ -116,20 +173,46 @@ def _instrument_func_type_completion(span: trace_api.Span, kwargs: Dict[str, Any
     _set_span_attribute(
         span, SpanAttributes.OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKindValues.LLM.value
     )
-    _set_span_attribute(span, SpanAttributes.LLM_MODEL_NAME, kwargs.get("model", "unknown_model"))
+    model = kwargs.get("model")
+    if model:
+        span.set_attribute(SpanAttributes.LLM_MODEL_NAME, model)
+        provider = _get_oi_provider_from_litellm_model_name(model)
+        span.set_attributes(get_llm_provider_attributes(provider))
 
     if messages := kwargs.get("messages"):
-        _set_span_attribute(span, SpanAttributes.INPUT_VALUE, json.dumps(messages))
-        for index, input_message in list(enumerate(messages)):
+        messages_as_dicts = []
+        for input_message in messages:
+            if isinstance(input_message, LitellmMessage):
+                messages_as_dicts.append(input_message.json())  # type: ignore[no-untyped-call]
+            else:
+                messages_as_dicts.append(input_message)
+
+        for index, input_message in enumerate(messages):
             for key, value in _get_attributes_from_message_param(input_message):
                 _set_span_attribute(
                     span, f"{SpanAttributes.LLM_INPUT_MESSAGES}.{index}.{key}", value
                 )
 
-    invocation_params = {k: v for k, v in kwargs.items() if k not in ["model", "messages"]}
+        if messages_as_dicts:
+            _set_span_attribute(
+                span, SpanAttributes.INPUT_VALUE, safe_json_dumps({"messages": messages_as_dicts})
+            )
+            _set_span_attribute(span, SpanAttributes.INPUT_MIME_TYPE, "application/json")
+
+    invocation_params = {k: v for k, v in kwargs.items() if k not in KEYS_TO_REDACT}
     _set_span_attribute(
         span, SpanAttributes.LLM_INVOCATION_PARAMETERS, safe_json_dumps(invocation_params)
     )
+
+    # Capture tool schemas
+    if tools := kwargs.get("tools"):
+        if isinstance(tools, list):
+            for idx, tool in enumerate(tools):
+                _set_span_attribute(
+                    span,
+                    f"{SpanAttributes.LLM_TOOLS}.{idx}.{ToolAttributes.TOOL_JSON_SCHEMA}",
+                    safe_json_dumps(tool),
+                )
 
 
 def _instrument_func_type_embedding(span: trace_api.Span, kwargs: Dict[str, Any]) -> None:
@@ -167,12 +250,10 @@ def _instrument_func_type_image_generation(span: trace_api.Span, kwargs: Dict[st
 
 def _finalize_span(span: trace_api.Span, result: Any) -> None:
     if isinstance(result, ModelResponse):
+        _set_output_message_value(span, result)
         for idx, choice in enumerate(result.choices):
             if not isinstance(choice, Choices):
                 continue
-
-            if idx == 0 and choice.message and (output := choice.message.content):
-                _set_span_attribute(span, SpanAttributes.OUTPUT_VALUE, output)
 
             for key, value in _get_attributes_from_message_param(choice.message):
                 _set_span_attribute(
@@ -188,7 +269,7 @@ def _finalize_span(span: trace_api.Span, result: Any) -> None:
                 json.dumps(first_embedding.get("embedding", [])),
             )
     elif isinstance(result, ImageResponse):
-        if len(result.data) > 0:
+        if result.data and len(result.data) > 0:
             if img_data := result.data[0]:
                 if isinstance(img_data, Image) and (url := (img_data.url or img_data.b64_json)):
                     _set_span_attribute(span, ImageAttributes.IMAGE_URL, url)
@@ -198,16 +279,142 @@ def _finalize_span(span: trace_api.Span, result: Any) -> None:
                 ):
                     _set_span_attribute(span, ImageAttributes.IMAGE_URL, url)
                     _set_span_attribute(span, SpanAttributes.OUTPUT_VALUE, url)
-    if hasattr(result, "usage"):
+
+    _set_token_counts_from_usage(span, result)
+    _set_span_status(span, result)
+
+
+# Gets values safely from an object
+def _get_value(obj: object, key: str) -> Any:
+    if hasattr(obj, key):
+        return getattr(obj, key)
+    return None
+
+
+def _set_token_counts_from_usage(span: trace_api.Span, result: Any) -> None:
+    """
+    Sets token count attributes on a span based on the usage information in result.
+    """
+    # Return early if no usage information
+    if not hasattr(result, "usage"):
+        return
+
+    usage = result.usage
+    if not usage:
+        return
+
+    prompt_tokens = _get_value(usage, "prompt_tokens")
+    if prompt_tokens is not None:
+        _set_span_attribute(span, SpanAttributes.LLM_TOKEN_COUNT_PROMPT, prompt_tokens)
+
+    prompt_token_details = _get_value(usage, "prompt_tokens_details")
+    if prompt_token_details is not None:
+        cached_tokens = _get_value(prompt_token_details, "cached_tokens")
+        if cached_tokens is not None:
+            _set_span_attribute(
+                span, SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ, cached_tokens
+            )
+
+        audio_tokens = _get_value(prompt_token_details, "audio_tokens")
+        if audio_tokens is not None:
+            _set_span_attribute(
+                span, SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO, audio_tokens
+            )
+
+    completion_tokens = _get_value(usage, "completion_tokens")
+    if completion_tokens is not None:
+        _set_span_attribute(span, SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, completion_tokens)
+
+    completion_tokens_details = _get_value(usage, "completion_tokens_details")
+    if completion_tokens_details is not None:
+        reasoning_tokens = _get_value(completion_tokens_details, "reasoning_tokens")
+        if reasoning_tokens is not None:
+            _set_span_attribute(
+                span, SpanAttributes.LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING, reasoning_tokens
+            )
+
+        completion_audio_tokens = _get_value(completion_tokens_details, "audio_tokens")
+        if completion_audio_tokens is not None:
+            _set_span_attribute(
+                span,
+                SpanAttributes.LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO,
+                completion_audio_tokens,
+            )
+
+    total_tokens = _get_value(usage, "total_tokens")
+    if total_tokens is not None:
+        _set_span_attribute(span, SpanAttributes.LLM_TOKEN_COUNT_TOTAL, total_tokens)
+
+    cache_creation_input_tokens = _get_value(usage, "cache_creation_input_tokens")
+    if cache_creation_input_tokens is not None:
         _set_span_attribute(
-            span, SpanAttributes.LLM_TOKEN_COUNT_PROMPT, result.usage["prompt_tokens"]
+            span,
+            SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE,
+            cache_creation_input_tokens,
         )
+
+    cache_read_input_tokens = _get_value(usage, "cache_read_input_tokens")
+    if cache_read_input_tokens is not None:
         _set_span_attribute(
-            span, SpanAttributes.LLM_TOKEN_COUNT_COMPLETION, result.usage["completion_tokens"]
+            span, SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ, cache_read_input_tokens
         )
-        _set_span_attribute(
-            span, SpanAttributes.LLM_TOKEN_COUNT_TOTAL, result.usage["total_tokens"]
-        )
+
+
+def _set_span_status(span: trace_api.Span, result: Any) -> None:
+    """
+    Sets the span status based on whether the result contains an error.
+    """
+    error = _get_value(result, "error")
+    if error is None and isinstance(result, dict):
+        error = result.get("error", None)
+
+    if error is not None:
+        span.set_status(trace_api.Status(trace_api.StatusCode.ERROR, description=str(error)))
+    else:
+        span.set_status(trace_api.Status(trace_api.StatusCode.OK))
+
+
+def _finalize_sync_streaming_span(span: trace_api.Span, stream: CustomStreamWrapper) -> Any:
+    output_messages: Dict[int, Dict[str, Any]] = {}
+    usage_stats = None
+    aggregated_output = None
+    try:
+        for token in stream:
+            if token.choices:
+                for choice in token.choices:
+                    idx = choice.index
+                    if idx not in output_messages:
+                        output_messages[idx] = {"role": None, "content": ""}
+                    delta = choice.delta
+                    if delta:
+                        role = getattr(delta, "role", None)
+                        content = getattr(delta, "content", None)
+                        if role is not None and output_messages[idx]["role"] is None:
+                            output_messages[idx]["role"] = role
+                        if content is not None:
+                            output_messages[idx]["content"] += content
+            usage_attrs = getattr(token, "usage", None)
+            if usage_attrs:
+                usage_stats = usage_attrs
+            yield token
+        aggregated_output = output_messages.get(0, {}).get("content", "")
+        _set_span_attribute(span, SpanAttributes.OUTPUT_VALUE, aggregated_output)
+        for idx, msg in output_messages.items():
+            message = {"role": msg.get("role"), "content": msg.get("content")}
+            for key, value in _get_attributes_from_message_param(message):
+                _set_span_attribute(
+                    span, f"{SpanAttributes.LLM_OUTPUT_MESSAGES}.{idx}.{key}", value
+                )
+
+        if usage_stats:
+            _set_token_counts_from_usage(span, usage_stats)
+    except Exception as e:
+        span.record_exception(e)
+        raise
+    else:
+        _set_span_status(span, aggregated_output)
+    finally:
+        span.end()
 
 
 async def _finalize_streaming_span(span: trace_api.Span, stream: CustomStreamWrapper) -> Any:
@@ -228,8 +435,9 @@ async def _finalize_streaming_span(span: trace_api.Span, stream: CustomStreamWra
                             output_messages[idx]["role"] = role
                         if content is not None:
                             output_messages[idx]["content"] += content
-            if getattr(token, "usage", None):
-                usage_stats = token.usage
+            usage_attrs = getattr(token, "usage", None)
+            if usage_attrs:
+                usage_stats = usage_attrs
             yield token
         aggregated_output = output_messages.get(0, {}).get("content", "")
         _set_span_attribute(span, SpanAttributes.OUTPUT_VALUE, aggregated_output)
@@ -239,19 +447,8 @@ async def _finalize_streaming_span(span: trace_api.Span, stream: CustomStreamWra
                 _set_span_attribute(
                     span, f"{SpanAttributes.LLM_OUTPUT_MESSAGES}.{idx}.{key}", value
                 )
-
         if usage_stats:
-            _set_span_attribute(
-                span, SpanAttributes.LLM_TOKEN_COUNT_PROMPT, usage_stats.get("prompt_tokens")
-            )
-            _set_span_attribute(
-                span,
-                SpanAttributes.LLM_TOKEN_COUNT_COMPLETION,
-                usage_stats.get("completion_tokens"),
-            )
-            _set_span_attribute(
-                span, SpanAttributes.LLM_TOKEN_COUNT_TOTAL, usage_stats.get("total_tokens")
-            )
+            _set_token_counts_from_usage(span, usage_stats)
     except Exception as e:
         span.record_exception(e)
         raise
@@ -311,13 +508,29 @@ class LiteLLMInstrumentor(BaseInstrumentor):  # type: ignore
     def _completion_wrapper(self, *args: Any, **kwargs: Any) -> ModelResponse:
         if context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY):
             return self.original_litellm_funcs["completion"](*args, **kwargs)  # type:ignore
-        with self._tracer.start_as_current_span(
-            name="completion", attributes=dict(get_attributes_from_context())
-        ) as span:
+
+        if kwargs.get("stream", False):
+            span = self._tracer.start_span(
+                name="completion", attributes=dict(get_attributes_from_context())
+            )
             _instrument_func_type_completion(span, kwargs)
+
             result = self.original_litellm_funcs["completion"](*args, **kwargs)
+
+            if isinstance(result, CustomStreamWrapper):
+                return _finalize_sync_streaming_span(span, result)  # type:ignore
+
             _finalize_span(span, result)
-        return result  # type:ignore
+            span.end()
+            return result  # type:ignore
+        else:
+            with self._tracer.start_as_current_span(
+                name="completion", attributes=dict(get_attributes_from_context())
+            ) as span:
+                _instrument_func_type_completion(span, kwargs)
+                result = self.original_litellm_funcs["completion"](*args, **kwargs)
+                _finalize_span(span, result)
+                return result  # type:ignore
 
     @wraps(litellm.acompletion)
     async def _acompletion_wrapper(
@@ -326,19 +539,26 @@ class LiteLLMInstrumentor(BaseInstrumentor):  # type: ignore
         if context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY):
             return await self.original_litellm_funcs["acompletion"](*args, **kwargs)  # type:ignore
 
-        result = await self.original_litellm_funcs["acompletion"](*args, **kwargs)
-
-        if hasattr(result, "__aiter__"):
+        if kwargs.get("stream", False):
             span = self._tracer.start_span(
                 name="acompletion", attributes=dict(get_attributes_from_context())
             )
             _instrument_func_type_completion(span, kwargs)
-            return _finalize_streaming_span(span, result)  # type:ignore
+
+            result = await self.original_litellm_funcs["acompletion"](*args, **kwargs)
+
+            if hasattr(result, "__aiter__"):
+                return _finalize_streaming_span(span, result)  # type:ignore
+
+            _finalize_span(span, result)
+            span.end()
+            return result  # type:ignore
         else:
             with self._tracer.start_as_current_span(
                 name="acompletion", attributes=dict(get_attributes_from_context())
             ) as span:
                 _instrument_func_type_completion(span, kwargs)
+                result = await self.original_litellm_funcs["acompletion"](*args, **kwargs)
                 _finalize_span(span, result)
                 return result  # type:ignore
 

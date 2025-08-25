@@ -7,9 +7,14 @@ import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { suppressTracing } from "@opentelemetry/core";
 import { context } from "@opentelemetry/api";
 
-import * as OpenAI from "openai";
+import OpenAI, { APIPromise, AzureOpenAI } from "openai";
 import { Stream } from "openai/streaming";
 import { setPromptTemplate, setSession } from "@arizeai/openinference-core";
+import { CreateEmbeddingResponse } from "openai/resources/embeddings";
+import { z } from "zod";
+import { zodResponseFormat } from "openai/helpers/zod";
+import { registerInstrumentations } from "@opentelemetry/instrumentation";
+import { vi } from "vitest";
 
 // Function tools
 async function getCurrentLocation() {
@@ -20,6 +25,8 @@ async function getWeather(_args: { location: string }) {
   return { temperature: 52, precipitation: "rainy" };
 }
 
+process.env.OPENAI_API_KEY = "fake-api-key";
+
 const memoryExporter = new InMemorySpanExporter();
 
 describe("OpenAIInstrumentation", () => {
@@ -27,7 +34,7 @@ describe("OpenAIInstrumentation", () => {
   tracerProvider.register();
   const instrumentation = new OpenAIInstrumentation();
   instrumentation.disable();
-  let openai: OpenAI.OpenAI;
+  let openai: OpenAI;
 
   instrumentation.setTracerProvider(tracerProvider);
   tracerProvider.addSpanProcessor(new SimpleSpanProcessor(memoryExporter));
@@ -36,7 +43,7 @@ describe("OpenAIInstrumentation", () => {
 
   beforeAll(() => {
     instrumentation.enable();
-    openai = new OpenAI.OpenAI({
+    openai = new OpenAI({
       apiKey: "fake-api-key",
     });
   });
@@ -47,7 +54,7 @@ describe("OpenAIInstrumentation", () => {
     memoryExporter.reset();
   });
   afterEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
   });
   it("is patched", () => {
     expect(
@@ -85,7 +92,7 @@ describe("OpenAIInstrumentation", () => {
       },
     };
     // Mock out the chat completions endpoint
-    jest.spyOn(openai, "post").mockImplementation(
+    vi.spyOn(openai, "post").mockImplementation(
       // @ts-expect-error the response type is not correct - this is just for testing
       async (): Promise<unknown> => {
         return response;
@@ -120,6 +127,69 @@ describe("OpenAIInstrumentation", () => {
 }
 `);
   });
+  it("captures the token count details for caching", async () => {
+    const response = {
+      id: "chatcmpl-8adq9JloOzNZ9TyuzrKyLpGXexh6p",
+      object: "chat.completion",
+      created: 1703743645,
+      model: "gpt-4o-mini",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "This is a test.",
+          },
+          logprobs: null,
+          finish_reason: "stop",
+        },
+      ],
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 5,
+        total_tokens: 17,
+        prompt_tokens_details: {
+          cached_tokens: 1,
+        },
+      },
+    };
+    // Mock out the chat completions endpoint
+    vi.spyOn(openai, "post").mockImplementation(
+      // @ts-expect-error the response type is not correct - this is just for testing
+      async (): Promise<unknown> => {
+        return response;
+      },
+    );
+    await openai.chat.completions.create({
+      messages: [{ role: "user", content: "Say this is a test" }],
+      model: "gpt-4o-mini",
+    });
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    const span = spans[0];
+    expect(span.name).toBe("OpenAI Chat Completions");
+    expect(span.attributes).toMatchInlineSnapshot(`
+    {
+      "input.mime_type": "application/json",
+      "input.value": "{"messages":[{"role":"user","content":"Say this is a test"}],"model":"gpt-4o-mini"}",
+      "llm.input_messages.0.message.content": "Say this is a test",
+      "llm.input_messages.0.message.role": "user",
+      "llm.invocation_parameters": "{"model":"gpt-4o-mini"}",
+      "llm.model_name": "gpt-4o-mini",
+      "llm.output_messages.0.message.content": "This is a test.",
+      "llm.output_messages.0.message.role": "assistant",
+      "llm.provider": "openai",
+      "llm.system": "openai",
+      "llm.token_count.completion": 5,
+      "llm.token_count.prompt": 12,
+      "llm.token_count.prompt_details.cache_read": 1,
+      "llm.token_count.total": 17,
+      "openinference.span.kind": "LLM",
+      "output.mime_type": "application/json",
+      "output.value": "{"id":"chatcmpl-8adq9JloOzNZ9TyuzrKyLpGXexh6p","object":"chat.completion","created":1703743645,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"This is a test."},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"prompt_tokens_details":{"cached_tokens":1}}}",
+    }
+    `);
+  });
   it("creates a span for completions", async () => {
     const response = {
       id: "cmpl-8fZu1H3VijJUWev9asnxaYyQvJTC9",
@@ -137,7 +207,7 @@ describe("OpenAIInstrumentation", () => {
       usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 },
     };
     // Mock out the completions endpoint
-    jest.spyOn(openai, "post").mockImplementation(
+    vi.spyOn(openai, "post").mockImplementation(
       // @ts-expect-error the response type is not correct - this is just for testing
       async (): Promise<unknown> => {
         return response;
@@ -169,43 +239,65 @@ describe("OpenAIInstrumentation", () => {
 `);
   });
   it("creates a span for embedding create", async () => {
-    const response = {
+    const response: CreateEmbeddingResponse = {
       object: "list",
       data: [{ object: "embedding", index: 0, embedding: [1, 2, 3] }],
+      model: "text-embedding-ada-003-small",
+      usage: { prompt_tokens: 0, total_tokens: 0 },
     };
+
     // Mock out the embedding create endpoint
-    jest.spyOn(openai, "post").mockImplementation(
-      // @ts-expect-error the response type is not correct - this is just for testing
-      async (): Promise<unknown> => {
-        return response;
-      },
-    );
+    vi.spyOn(openai, "post").mockImplementation(() => {
+      return new APIPromise(
+        openai,
+        Promise.resolve({
+          requestLogID: "123",
+          retryOfRequestLogID: "123",
+          startTime: 123,
+          response: {
+            json: () => Promise.resolve(response),
+            text: () => Promise.resolve(JSON.stringify(response)),
+            clone: () => ({
+              json: () => Promise.resolve(response),
+              text: () => Promise.resolve(JSON.stringify(response)),
+            }),
+            headers: new Headers({ "content-type": "application/json" }),
+            status: 200,
+            statusText: "OK",
+            ok: true,
+          } as Response,
+          options: {
+            method: "post",
+            path: "/embeddings",
+          },
+          controller: new AbortController(),
+        }),
+      );
+    });
+
     await openai.embeddings.create({
       input: "A happy moment",
-      model: "text-embedding-ada-002",
+      model: "text-embedding-ada-003-small",
     });
+
     const spans = memoryExporter.getFinishedSpans();
     expect(spans.length).toBe(1);
     const span = spans[0];
     expect(span.name).toBe("OpenAI Embeddings");
-    expect(span.attributes).toMatchInlineSnapshot(`
-      {
-        "embedding.embeddings.0.embedding.text": "A happy moment",
-        "embedding.embeddings.0.embedding.vector": [
-          1,
-          2,
-          3,
-        ],
-        "embedding.model_name": "text-embedding-ada-002",
-        "input.mime_type": "text/plain",
-        "input.value": "A happy moment",
-        "openinference.span.kind": "EMBEDDING",
-      }
-    `);
+    // Check the attributes
+    expect(span.attributes["embedding.embeddings.0.embedding.text"]).toBe(
+      "A happy moment",
+    );
+    expect(span.attributes["embedding.model_name"]).toBe(
+      "text-embedding-ada-003-small",
+    );
+    expect(span.attributes["input.mime_type"]).toBe("text/plain");
+    expect(span.attributes["input.value"]).toBe("A happy moment");
+    expect(span.attributes["openinference.span.kind"]).toBe("EMBEDDING");
   });
   it("can handle streaming responses", async () => {
     // Mock out the post endpoint to return a stream
-    jest.spyOn(openai, "post").mockImplementation(
+    vi.spyOn(openai, "post").mockImplementation(
       // @ts-expect-error the response type is not correct - this is just for testing
       async (): Promise<unknown> => {
         const iterator = () =>
@@ -329,8 +421,7 @@ describe("OpenAIInstrumentation", () => {
       usage: { prompt_tokens: 121, completion_tokens: 20, total_tokens: 141 },
       system_fingerprint: null,
     };
-    jest
-      .spyOn(openai, "post")
+    vi.spyOn(openai, "post")
       .mockImplementationOnce(
         // @ts-expect-error the response type is not correct - this is just for testing
         async (): Promise<unknown> => {
@@ -351,7 +442,7 @@ describe("OpenAIInstrumentation", () => {
       );
 
     const messages = [];
-    const runner = openai.beta.chat.completions
+    const runner = openai.chat.completions
       .runTools({
         model: "gpt-3.5-turbo",
         messages: [{ role: "user", content: "How is the weather this week?" }],
@@ -486,7 +577,7 @@ describe("OpenAIInstrumentation", () => {
 `);
   });
   it("should capture tool calls with streaming", async () => {
-    jest.spyOn(openai, "post").mockImplementation(
+    vi.spyOn(openai, "post").mockImplementation(
       // @ts-expect-error the response type is not correct - this is just for testing
       async (): Promise<unknown> => {
         const iterator = () =>
@@ -618,7 +709,7 @@ describe("OpenAIInstrumentation", () => {
 `);
   });
   it("should capture a function call with streaming", async () => {
-    jest.spyOn(openai, "post").mockImplementation(
+    vi.spyOn(openai, "post").mockImplementation(
       // @ts-expect-error the response type is not correct - this is just for testing
       async (): Promise<unknown> => {
         const iterator = () =>
@@ -712,23 +803,23 @@ describe("OpenAIInstrumentation", () => {
     const span = spans[0];
     expect(span.name).toBe("OpenAI Chat Completions");
     expect(span.attributes).toMatchInlineSnapshot(`
-{
-  "input.mime_type": "application/json",
-  "input.value": "{"messages":[{"role":"user","content":"What's the weather today?"}],"model":"gpt-3.5-turbo","functions":[{"name":"getWeather","description":"Get the weather for a location.","parameters":{"type":"object","properties":{"location":{"type":"string"}}}},{"name":"getCurrentLocation","description":"Get the current location of the user.","parameters":{"type":"object","properties":{}}}],"stream":true}",
-  "llm.input_messages.0.message.content": "What's the weather today?",
-  "llm.input_messages.0.message.role": "user",
-  "llm.invocation_parameters": "{"model":"gpt-3.5-turbo","functions":[{"name":"getWeather","description":"Get the weather for a location.","parameters":{"type":"object","properties":{"location":{"type":"string"}}}},{"name":"getCurrentLocation","description":"Get the current location of the user.","parameters":{"type":"object","properties":{}}}],"stream":true}",
-  "llm.model_name": "gpt-3.5-turbo",
-  "llm.output_messages.0.message.content": "",
-  "llm.output_messages.0.message.function_call_arguments_json": "{}",
-  "llm.output_messages.0.message.function_call_name": "getWeather",
-  "llm.output_messages.0.message.role": "assistant",
-  "llm.provider": "openai",
-  "llm.system": "openai",
-  "openinference.span.kind": "LLM",
-  "output.mime_type": "text/plain",
-  "output.value": "",
-}
+      {
+        "input.mime_type": "application/json",
+        "input.value": "{"messages":[{"role":"user","content":"What's the weather today?"}],"model":"gpt-3.5-turbo","functions":[{"name":"getWeather","description":"Get the weather for a location.","parameters":{"type":"object","properties":{"location":{"type":"string"}}}},{"name":"getCurrentLocation","description":"Get the current location of the user.","parameters":{"type":"object","properties":{}}}],"stream":true}",
+        "llm.input_messages.0.message.content": "What's the weather today?",
+        "llm.input_messages.0.message.role": "user",
+        "llm.invocation_parameters": "{"model":"gpt-3.5-turbo","functions":[{"name":"getWeather","description":"Get the weather for a location.","parameters":{"type":"object","properties":{"location":{"type":"string"}}}},{"name":"getCurrentLocation","description":"Get the current location of the user.","parameters":{"type":"object","properties":{}}}],"stream":true}",
+        "llm.model_name": "gpt-3.5-turbo",
+        "llm.output_messages.0.message.content": "",
+        "llm.output_messages.0.message.function_call_arguments_json": "{}",
+        "llm.output_messages.0.message.function_call_name": "getWeather",
+        "llm.output_messages.0.message.role": "assistant",
+        "llm.provider": "openai",
+        "llm.system": "openai",
+        "openinference.span.kind": "LLM",
+        "output.mime_type": "text/plain",
+        "output.value": "",
+      }
 `);
   });
   it("should not emit a span if tracing is suppressed", async () => {
@@ -755,7 +846,7 @@ describe("OpenAIInstrumentation", () => {
       },
     };
     // Mock out the chat completions endpoint
-    jest.spyOn(openai, "post").mockImplementation(
+    vi.spyOn(openai, "post").mockImplementation(
       // @ts-expect-error the response type is not correct - this is just for testing
       async (): Promise<unknown> => {
         return response;
@@ -798,7 +889,7 @@ describe("OpenAIInstrumentation", () => {
       },
     };
     // Mock out the chat completions endpoint
-    jest.spyOn(openai, "post").mockImplementation(
+    vi.spyOn(openai, "post").mockImplementation(
       // @ts-expect-error the response type is not correct - this is just for testing
       async (): Promise<unknown> => {
         return response;
@@ -831,7 +922,7 @@ describe("OpenAIInstrumentation", () => {
   "input.value": "{"messages":[{"role":"user","content":[{"type":"text","text":"Say this is a test"},{"type":"image_url","image_url":{"url":"data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="}}]}],"model":"gpt-3.5-turbo"}",
   "llm.input_messages.0.message.contents.0.message_content.text": "Say this is a test",
   "llm.input_messages.0.message.contents.0.message_content.type": "text",
-  "llm.input_messages.0.message.contents.1.message_content.image": "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==",
+  "llm.input_messages.0.message.contents.1.message_content.image.image.url": "data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==",
   "llm.input_messages.0.message.contents.1.message_content.type": "image",
   "llm.input_messages.0.message.role": "user",
   "llm.invocation_parameters": "{"model":"gpt-3.5-turbo"}",
@@ -867,7 +958,7 @@ describe("OpenAIInstrumentation", () => {
       usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 },
     };
     // Mock out the completions endpoint
-    jest.spyOn(openai, "post").mockImplementation(
+    vi.spyOn(openai, "post").mockImplementation(
       // @ts-expect-error the response type is not correct - this is just for testing
       async (): Promise<unknown> => {
         return response;
@@ -914,6 +1005,104 @@ describe("OpenAIInstrumentation", () => {
 }
 `);
   });
+  it("creates a span for chat completions parse", async () => {
+    const response = {
+      id: "chatcmpl-parseTest",
+      object: "chat.completion",
+      created: 1706000000,
+      model: "gpt-4o-2024-08-06",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content:
+              '{"name":"science fair","date":"Friday","participants":["Alice","Bob"]}',
+          },
+          logprobs: null,
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 20, completion_tokens: 10, total_tokens: 30 },
+    };
+
+    // Mock out the post method that chat completions uses internally
+    vi.spyOn(openai, "post").mockImplementation(() => {
+      // Create a full APIPromise-like object that satisfies all OpenAI SDK expectations
+      const apiPromise = new APIPromise(
+        openai,
+        Promise.resolve({
+          requestLogID: "123",
+          retryOfRequestLogID: "123",
+          startTime: 123,
+          response: {
+            json: () => Promise.resolve(response),
+            text: () => Promise.resolve(JSON.stringify(response)),
+            clone: () => ({
+              json: () => Promise.resolve(response),
+              text: () => Promise.resolve(JSON.stringify(response)),
+            }),
+            headers: new Headers({ "content-type": "application/json" }),
+            status: 200,
+            statusText: "OK",
+            ok: true,
+          } as Response,
+          options: {
+            method: "post",
+            path: "/chat/completions",
+          },
+          controller: new AbortController(),
+        }),
+      );
+      return apiPromise;
+    });
+
+    const CalendarEvent = z.object({
+      name: z.string(),
+      date: z.string(),
+      participants: z.array(z.string()),
+    });
+
+    // Invoke the helper method under test
+    await openai.chat.completions.parse({
+      model: "gpt-4o-2024-08-06",
+      messages: [
+        { role: "system", content: "Extract the event information." },
+        {
+          role: "user",
+          content: "Alice and Bob are going to a science fair on Friday.",
+        },
+      ],
+      response_format: zodResponseFormat(CalendarEvent, "event"),
+    });
+
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    const span = spans[0];
+    expect(span.name).toBe("OpenAI Chat Completions");
+    expect(span.attributes).toMatchInlineSnapshot(`
+{
+  "input.mime_type": "application/json",
+  "input.value": "{"model":"gpt-4o-2024-08-06","messages":[{"role":"system","content":"Extract the event information."},{"role":"user","content":"Alice and Bob are going to a science fair on Friday."}],"response_format":{"type":"json_schema","json_schema":{"name":"event","strict":true,"schema":{"type":"object","properties":{"name":{"type":"string"},"date":{"type":"string"},"participants":{"type":"array","items":{"type":"string"}}},"required":["name","date","participants"],"additionalProperties":false,"$schema":"http://json-schema.org/draft-07/schema#"}}}}",
+  "llm.input_messages.0.message.content": "Extract the event information.",
+  "llm.input_messages.0.message.role": "system",
+  "llm.input_messages.1.message.content": "Alice and Bob are going to a science fair on Friday.",
+  "llm.input_messages.1.message.role": "user",
+  "llm.invocation_parameters": "{"model":"gpt-4o-2024-08-06","response_format":{"type":"json_schema","json_schema":{"name":"event","strict":true,"schema":{"type":"object","properties":{"name":{"type":"string"},"date":{"type":"string"},"participants":{"type":"array","items":{"type":"string"}}},"required":["name","date","participants"],"additionalProperties":false,"$schema":"http://json-schema.org/draft-07/schema#"}}}}",
+  "llm.model_name": "gpt-4o-2024-08-06",
+  "llm.output_messages.0.message.content": "{"name":"science fair","date":"Friday","participants":["Alice","Bob"]}",
+  "llm.output_messages.0.message.role": "assistant",
+  "llm.provider": "openai",
+  "llm.system": "openai",
+  "llm.token_count.completion": 10,
+  "llm.token_count.prompt": 20,
+  "llm.token_count.total": 30,
+  "openinference.span.kind": "LLM",
+  "output.mime_type": "application/json",
+  "output.value": "{"id":"chatcmpl-parseTest","object":"chat.completion","created":1706000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"{\\"name\\":\\"science fair\\",\\"date\\":\\"Friday\\",\\"participants\\":[\\"Alice\\",\\"Bob\\"]}"},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30}}",
+}
+`);
+  });
 });
 
 describe("OpenAIInstrumentation with TraceConfig", () => {
@@ -923,7 +1112,7 @@ describe("OpenAIInstrumentation with TraceConfig", () => {
     traceConfig: { hideInputs: true },
   });
   instrumentation.disable();
-  let openai: OpenAI.OpenAI;
+  let openai: OpenAI;
 
   instrumentation.setTracerProvider(tracerProvider);
   tracerProvider.addSpanProcessor(new SimpleSpanProcessor(memoryExporter));
@@ -932,7 +1121,7 @@ describe("OpenAIInstrumentation with TraceConfig", () => {
 
   beforeAll(() => {
     instrumentation.enable();
-    openai = new OpenAI.OpenAI({
+    openai = new OpenAI({
       apiKey: "fake-api-key",
     });
   });
@@ -943,7 +1132,7 @@ describe("OpenAIInstrumentation with TraceConfig", () => {
     memoryExporter.reset();
   });
   afterEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
   });
   it("is patched", () => {
     expect(
@@ -968,7 +1157,7 @@ describe("OpenAIInstrumentation with TraceConfig", () => {
       usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 },
     };
     // Mock out the completions endpoint
-    jest.spyOn(openai, "post").mockImplementation(
+    vi.spyOn(openai, "post").mockImplementation(
       // @ts-expect-error the response type is not correct - this is just for testing
       async (): Promise<unknown> => {
         return response;
@@ -998,5 +1187,478 @@ describe("OpenAIInstrumentation with TraceConfig", () => {
   "output.value": "This is a test",
 }
 `);
+  });
+});
+
+describe("AzureOpenAIInstrumentation", () => {
+  const tracerProvider = new NodeTracerProvider();
+  tracerProvider.register();
+  const instrumentation = new OpenAIInstrumentation();
+  instrumentation.disable();
+  let azureOpenai: AzureOpenAI;
+
+  instrumentation.setTracerProvider(tracerProvider);
+  tracerProvider.addSpanProcessor(new SimpleSpanProcessor(memoryExporter));
+  // @ts-expect-error the moduleExports property is private. This is needed to make the test work with auto-mocking
+  instrumentation._modules[0].moduleExports = OpenAI;
+
+  beforeAll(() => {
+    instrumentation.enable();
+    azureOpenai = new AzureOpenAI({
+      apiKey: "fake-api-key",
+      endpoint: "https://my-azure-openai.openai.azure.com",
+      apiVersion: "2024-02-15-preview",
+    });
+  });
+  afterAll(() => {
+    instrumentation.disable();
+  });
+  beforeEach(() => {
+    memoryExporter.reset();
+  });
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("is patched", () => {
+    expect(
+      (OpenAI as { openInferencePatched?: boolean }).openInferencePatched,
+    ).toBe(true);
+    expect(isPatched()).toBe(true);
+  });
+
+  it("creates a span for chat completions", async () => {
+    const response = {
+      id: "chatcmpl-8adq9JloOzNZ9TyuzrKyLpGXexh6p",
+      object: "chat.completion",
+      created: 1703743645,
+      model: "gpt-35-turbo",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "This is a test.",
+          },
+          logprobs: null,
+          finish_reason: "stop",
+        },
+      ],
+      usage: {
+        prompt_tokens: 12,
+        completion_tokens: 5,
+        total_tokens: 17,
+      },
+    };
+    // Mock out the chat completions endpoint
+    vi.spyOn(azureOpenai, "post").mockImplementation(
+      // @ts-expect-error the response type is not correct - this is just for testing
+      async (): Promise<unknown> => {
+        return response;
+      },
+    );
+    await azureOpenai.chat.completions.create({
+      messages: [{ role: "user", content: "Say this is a test" }],
+      model: "gpt-35-turbo",
+    });
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    const span = spans[0];
+    expect(span.name).toBe("OpenAI Chat Completions");
+    expect(span.attributes).toMatchInlineSnapshot(`
+{
+  "input.mime_type": "application/json",
+  "input.value": "{"messages":[{"role":"user","content":"Say this is a test"}],"model":"gpt-35-turbo"}",
+  "llm.input_messages.0.message.content": "Say this is a test",
+  "llm.input_messages.0.message.role": "user",
+  "llm.invocation_parameters": "{"model":"gpt-35-turbo"}",
+  "llm.model_name": "gpt-35-turbo",
+  "llm.output_messages.0.message.content": "This is a test.",
+  "llm.output_messages.0.message.role": "assistant",
+  "llm.provider": "azure",
+  "llm.system": "openai",
+  "llm.token_count.completion": 5,
+  "llm.token_count.prompt": 12,
+  "llm.token_count.total": 17,
+  "openinference.span.kind": "LLM",
+  "output.mime_type": "application/json",
+  "output.value": "{"id":"chatcmpl-8adq9JloOzNZ9TyuzrKyLpGXexh6p","object":"chat.completion","created":1703743645,"model":"gpt-35-turbo","choices":[{"index":0,"message":{"role":"assistant","content":"This is a test."},"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}",
+}
+`);
+  });
+
+  it("creates a span for embeddings", async () => {
+    const response: CreateEmbeddingResponse = {
+      object: "list",
+      data: [{ object: "embedding", index: 0, embedding: [1, 2, 3] }],
+      model: "text-embedding-ada-002",
+      usage: { prompt_tokens: 0, total_tokens: 0 },
+    };
+
+    // Mock out the embedding create endpoint
+    vi.spyOn(azureOpenai, "post").mockImplementation(() => {
+      return new APIPromise(
+        azureOpenai,
+        Promise.resolve({
+          requestLogID: "123",
+          retryOfRequestLogID: "123",
+          startTime: 123,
+          response: {
+            json: () => Promise.resolve(response),
+            text: () => Promise.resolve(JSON.stringify(response)),
+            clone: () => ({
+              json: () => Promise.resolve(response),
+              text: () => Promise.resolve(JSON.stringify(response)),
+            }),
+            headers: new Headers({ "content-type": "application/json" }),
+            status: 200,
+            statusText: "OK",
+            ok: true,
+          } as Response,
+          options: {
+            method: "post",
+            path: "/embeddings",
+          },
+          controller: new AbortController(),
+        }),
+      );
+    });
+
+    await azureOpenai.embeddings.create({
+      input: "A happy moment",
+      model: "text-embedding-ada-002",
+    });
+
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    const span = spans[0];
+    expect(span.name).toBe("OpenAI Embeddings");
+    // Check the attributes
+    expect(span.attributes["embedding.embeddings.0.embedding.text"]).toBe(
+      "A happy moment",
+    );
+    expect(span.attributes["embedding.model_name"]).toBe(
+      "text-embedding-ada-002",
+    );
+    expect(span.attributes["input.mime_type"]).toBe("text/plain");
+    expect(span.attributes["input.value"]).toBe("A happy moment");
+    expect(span.attributes["openinference.span.kind"]).toBe("EMBEDDING");
+  });
+
+  it("can handle streaming responses", async () => {
+    // Mock out the post endpoint to return a stream
+    vi.spyOn(azureOpenai, "post").mockImplementation(
+      // @ts-expect-error the response type is not correct - this is just for testing
+      async (): Promise<unknown> => {
+        const iterator = () =>
+          (async function* () {
+            yield { choices: [{ delta: { content: "This is " } }] };
+            yield { choices: [{ delta: { content: "a test." } }] };
+            yield { choices: [{ delta: { finish_reason: "stop" } }] };
+          })();
+        const controller = new AbortController();
+        return new Stream(iterator, controller);
+      },
+    );
+    const stream = await azureOpenai.chat.completions.create({
+      messages: [{ role: "user", content: "Say this is a test" }],
+      model: "gpt-35-turbo",
+      stream: true,
+    });
+
+    let response = "";
+    for await (const chunk of stream) {
+      if (chunk.choices[0].delta.content)
+        response += chunk.choices[0].delta.content;
+    }
+    expect(response).toBe("This is a test.");
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    const span = spans[0];
+    expect(span.name).toBe("OpenAI Chat Completions");
+    expect(span.attributes).toMatchInlineSnapshot(`
+{
+  "input.mime_type": "application/json",
+  "input.value": "{"messages":[{"role":"user","content":"Say this is a test"}],"model":"gpt-35-turbo","stream":true}",
+  "llm.input_messages.0.message.content": "Say this is a test",
+  "llm.input_messages.0.message.role": "user",
+  "llm.invocation_parameters": "{"model":"gpt-35-turbo","stream":true}",
+  "llm.model_name": "gpt-35-turbo",
+  "llm.output_messages.0.message.content": "This is a test.",
+  "llm.output_messages.0.message.role": "assistant",
+  "llm.provider": "azure",
+  "llm.system": "openai",
+  "openinference.span.kind": "LLM",
+  "output.mime_type": "text/plain",
+  "output.value": "This is a test.",
+}
+`);
+  });
+});
+
+describe("OpenAIInstrumentation with a custom tracer provider", () => {
+  describe("OpenAIInstrumentation with custom TracerProvider passed in", () => {
+    const customTracerProvider = new NodeTracerProvider();
+    const customMemoryExporter = new InMemorySpanExporter();
+    let openai: OpenAI;
+
+    // Note: We don't register this provider globally.
+    customTracerProvider.addSpanProcessor(
+      new SimpleSpanProcessor(customMemoryExporter),
+    );
+
+    // Instantiate instrumentation with the custom provider
+    const instrumentation = new OpenAIInstrumentation({
+      tracerProvider: customTracerProvider,
+    });
+    instrumentation.disable();
+
+    // Mock the module exports like in other tests
+    // @ts-expect-error the moduleExports property is private. This is needed to make the test work with auto-mocking
+    instrumentation._modules[0].moduleExports = OpenAI;
+
+    beforeAll(() => {
+      instrumentation.enable();
+      openai = new OpenAI({
+        apiKey: "fake-api-key",
+      });
+    });
+
+    afterAll(() => {
+      instrumentation.disable();
+    });
+
+    beforeEach(() => {
+      memoryExporter.reset();
+      customMemoryExporter.reset();
+    });
+
+    afterEach(() => {
+      vi.resetAllMocks();
+      vi.clearAllMocks();
+    });
+
+    it("should use the provided tracer provider instead of the global one", async () => {
+      const response = {
+        id: "chatcmpl-test",
+        object: "chat.completion",
+        created: 1703743645,
+        model: "gpt-3.5-turbo-0613",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "This is a test.",
+            },
+            logprobs: null,
+            finish_reason: "stop",
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 5,
+          total_tokens: 17,
+        },
+      };
+
+      vi.spyOn(openai, "post").mockImplementation(
+        // @ts-expect-error the response type is not correct - this is just for testing
+        async (): Promise<unknown> => {
+          return response;
+        },
+      );
+
+      await openai.chat.completions.create({
+        messages: [{ role: "user", content: "Say this is a test" }],
+        model: "gpt-3.5-turbo",
+      });
+
+      const spans = customMemoryExporter.getFinishedSpans();
+      const globalSpans = memoryExporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      expect(globalSpans.length).toBe(0);
+      const span = spans[0];
+      expect(span.name).toBe("OpenAI Chat Completions");
+      expect(span.attributes["llm.provider"]).toBe("openai");
+      expect(span.attributes["llm.model_name"]).toBe("gpt-3.5-turbo-0613");
+    });
+  });
+
+  describe("OpenAIInstrumentation with custom TracerProvider set", () => {
+    const customTracerProvider = new NodeTracerProvider();
+    const customMemoryExporter = new InMemorySpanExporter();
+    let openai: OpenAI;
+
+    // Note: We don't register this provider globally.
+    customTracerProvider.addSpanProcessor(
+      new SimpleSpanProcessor(customMemoryExporter),
+    );
+
+    // Instantiate instrumentation with the custom provider
+    const instrumentation = new OpenAIInstrumentation();
+    instrumentation.setTracerProvider(customTracerProvider);
+    instrumentation.disable();
+
+    // Mock the module exports like in other tests
+    // @ts-expect-error the moduleExports property is private. This is needed to make the test work with auto-mocking
+    instrumentation._modules[0].moduleExports = OpenAI;
+
+    beforeAll(() => {
+      instrumentation.enable();
+      openai = new OpenAI({
+        apiKey: "fake-api-key",
+      });
+    });
+
+    afterAll(() => {
+      instrumentation.disable();
+    });
+
+    beforeEach(() => {
+      memoryExporter.reset();
+      customMemoryExporter.reset();
+    });
+
+    afterEach(() => {
+      vi.resetAllMocks();
+      vi.clearAllMocks();
+    });
+
+    it("should use the provided tracer provider instead of the global one", async () => {
+      const response = {
+        id: "chatcmpl-test",
+        object: "chat.completion",
+        created: 1703743645,
+        model: "gpt-3.5-turbo-0613",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "This is a test.",
+            },
+            logprobs: null,
+            finish_reason: "stop",
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 5,
+          total_tokens: 17,
+        },
+      };
+
+      vi.spyOn(openai, "post").mockImplementation(
+        // @ts-expect-error the response type is not correct - this is just for testing
+        async (): Promise<unknown> => {
+          return response;
+        },
+      );
+
+      await openai.chat.completions.create({
+        messages: [{ role: "user", content: "Say this is a test" }],
+        model: "gpt-3.5-turbo",
+      });
+
+      const spans = customMemoryExporter.getFinishedSpans();
+      const globalSpans = memoryExporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      expect(globalSpans.length).toBe(0);
+      const span = spans[0];
+      expect(span.name).toBe("OpenAI Chat Completions");
+      expect(span.attributes["llm.provider"]).toBe("openai");
+      expect(span.attributes["llm.model_name"]).toBe("gpt-3.5-turbo-0613");
+    });
+  });
+
+  describe("OpenAIInstrumentation with custom TracerProvider set via registerInstrumentations", () => {
+    const customTracerProvider = new NodeTracerProvider();
+    const customMemoryExporter = new InMemorySpanExporter();
+    let openai: OpenAI;
+
+    // Note: We don't register this provider globally.
+    customTracerProvider.addSpanProcessor(
+      new SimpleSpanProcessor(customMemoryExporter),
+    );
+
+    // Instantiate instrumentation with the custom provider
+    const instrumentation = new OpenAIInstrumentation();
+    registerInstrumentations({
+      instrumentations: [instrumentation],
+      tracerProvider: customTracerProvider,
+    });
+    instrumentation.disable();
+
+    // Mock the module exports like in other tests
+    // @ts-expect-error the moduleExports property is private. This is needed to make the test work with auto-mocking
+    instrumentation._modules[0].moduleExports = OpenAI;
+
+    beforeAll(() => {
+      instrumentation.enable();
+      openai = new OpenAI({
+        apiKey: "fake-api-key",
+      });
+    });
+
+    afterAll(() => {
+      instrumentation.disable();
+    });
+
+    beforeEach(() => {
+      memoryExporter.reset();
+      customMemoryExporter.reset();
+    });
+
+    afterEach(() => {
+      vi.resetAllMocks();
+      vi.clearAllMocks();
+    });
+
+    it("should use the provided tracer provider instead of the global one", async () => {
+      const response = {
+        id: "chatcmpl-test",
+        object: "chat.completion",
+        created: 1703743645,
+        model: "gpt-3.5-turbo-0613",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "This is a test.",
+            },
+            logprobs: null,
+            finish_reason: "stop",
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 5,
+          total_tokens: 17,
+        },
+      };
+
+      vi.spyOn(openai, "post").mockImplementation(
+        // @ts-expect-error the response type is not correct - this is just for testing
+        async (): Promise<unknown> => {
+          return response;
+        },
+      );
+
+      await openai.chat.completions.create({
+        messages: [{ role: "user", content: "Say this is a test" }],
+        model: "gpt-3.5-turbo",
+      });
+
+      const spans = customMemoryExporter.getFinishedSpans();
+      const globalSpans = memoryExporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      expect(globalSpans.length).toBe(0);
+      const span = spans[0];
+      expect(span.name).toBe("OpenAI Chat Completions");
+      expect(span.attributes["llm.provider"]).toBe("openai");
+      expect(span.attributes["llm.model_name"]).toBe("gpt-3.5-turbo-0613");
+    });
   });
 });

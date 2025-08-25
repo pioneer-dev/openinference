@@ -1,12 +1,15 @@
+import dataclasses
+import datetime
 import json
 import logging
-import math
+import re
 import time
 import traceback
 from copy import deepcopy
-from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from itertools import chain
+from pathlib import PurePath
 from threading import RLock
 from typing import (
     TYPE_CHECKING,
@@ -23,7 +26,10 @@ from typing import (
     Sequence,
     Tuple,
     TypeVar,
+    Union,
     cast,
+    get_args,
+    get_origin,
 )
 from uuid import UUID
 
@@ -33,7 +39,7 @@ from langchain_core.tracers import BaseTracer, LangChainTracer
 from langchain_core.tracers.schemas import Run
 from opentelemetry import context as context_api
 from opentelemetry import trace as trace_api
-from opentelemetry.context import _SUPPRESS_INSTRUMENTATION_KEY
+from opentelemetry.context import _SUPPRESS_INSTRUMENTATION_KEY, get_value
 from opentelemetry.semconv.trace import SpanAttributes as OTELSpanAttributes
 from opentelemetry.trace import Span
 from opentelemetry.util.types import AttributeValue
@@ -46,10 +52,13 @@ from openinference.semconv.trace import (
     ImageAttributes,
     MessageAttributes,
     MessageContentAttributes,
+    OpenInferenceLLMProviderValues,
+    OpenInferenceLLMSystemValues,
     OpenInferenceMimeTypeValues,
     OpenInferenceSpanKindValues,
     RerankerAttributes,
     SpanAttributes,
+    ToolAttributes,
     ToolCallAttributes,
 )
 
@@ -57,6 +66,14 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 _AUDIT_TIMING = False
+
+# Patterns for exception messages that should not be recorded on spans
+# These are exceptions that are expected for stopping agent execution and are not indicative of an
+# error in the application
+IGNORED_EXCEPTION_PATTERNS = [
+    r"^Command\(",
+    r"^ParentCommand\(",
+]
 
 
 @wrapt.decorator  # type: ignore
@@ -106,15 +123,35 @@ class _DictWithLock(ObjectProxy, Generic[K, V]):  # type: ignore
 
 
 class OpenInferenceTracer(BaseTracer):
-    __slots__ = ("_tracer", "_spans_by_run")
+    __slots__ = (
+        "_tracer",
+        "_separate_trace_from_runtime_context",
+        "_spans_by_run",
+    )
 
-    def __init__(self, tracer: trace_api.Tracer, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        tracer: trace_api.Tracer,
+        separate_trace_from_runtime_context: bool,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the OpenInferenceTracer.
+
+        Args:
+            tracer (trace_api.Tracer): The OpenTelemetry tracer for creating spans.
+            separate_trace_from_runtime_context (bool): When True, always start a new trace for each
+                span without a parent, isolating it from any existing trace in the runtime context.
+            *args (Any): Positional arguments for BaseTracer.
+            **kwargs (Any): Keyword arguments for BaseTracer.
+        """
         super().__init__(*args, **kwargs)
         if TYPE_CHECKING:
             # check that `run_map` still exists in parent class
             assert self.run_map
         self.run_map = _DictWithLock[str, Run](self.run_map)
         self._tracer = tracer
+        self._separate_trace_from_runtime_context = separate_trace_from_runtime_context
         self._spans_by_run: Dict[UUID, Span] = _DictWithLock[UUID, Span]()
         self._lock = RLock()  # handlers may be run in a thread by langchain
 
@@ -131,7 +168,7 @@ class OpenInferenceTracer(BaseTracer):
                 trace_api.set_span_in_context(parent)
                 if (parent_run_id := run.parent_run_id)
                 and (parent := self._spans_by_run.get(parent_run_id))
-                else None
+                else (context_api.Context() if self._separate_trace_from_runtime_context else None)
             )
         # We can't use real time because the handler may be
         # called in a background thread.
@@ -232,7 +269,10 @@ def _record_exception(span: Span, error: BaseException) -> None:
 
 @audit_timing  # type: ignore
 def _update_span(span: Span, run: Run) -> None:
-    if run.error is None:
+    # If there  is no error or if there is an agent control exception, set the span to OK
+    if run.error is None or any(
+        re.match(pattern, run.error) for pattern in IGNORED_EXCEPTION_PATTERNS
+    ):
         span.set_status(trace_api.StatusCode.OK)
     else:
         span.set_status(trace_api.Status(trace_api.StatusCode.ERROR, run.error))
@@ -254,7 +294,9 @@ def _update_span(span: Span, run: Run) -> None:
                     _output_messages(run.outputs),
                     _prompt_template(run),
                     _invocation_parameters(run),
-                    _model_name(run.extra),
+                    _llm_provider(run.extra),
+                    _llm_system(run.extra),
+                    _model_name(run.outputs, run.extra),
                     _token_counts(run.outputs),
                     _function_calls(run.outputs),
                     _tools(run),
@@ -319,23 +361,124 @@ def _as_output(values: Iterable[str]) -> Iterator[Tuple[str, str]]:
 
 
 def _convert_io(obj: Optional[Mapping[str, Any]]) -> Iterator[str]:
+    """
+    Convert input/output data to appropriate string representation for OpenInference spans.
+
+    This function handles different cases with increasing complexity:
+    1. Empty/None objects: return nothing
+    2. Single string values: return the string directly (performance optimization, no MIME type)
+    3. Single input/output key with non-string: use custom JSON formatting via _json_dumps
+       - Conditional MIME type: only for structured data (objects/arrays), not primitives
+    4. Multiple keys or other cases: use _json_dumps for consistent formatting
+       - Always includes JSON MIME type since these are always structured objects
+
+    Args:
+        obj: The input/output data mapping to convert
+
+    Yields:
+        str: The converted string representation
+        str: JSON MIME type (when applicable - see cases above)
+    """
     if not obj:
         return
     assert isinstance(obj, dict), f"expected dict, found {type(obj)}"
-    if len(obj) == 1 and isinstance(value := next(iter(obj.values())), str):
-        yield value
-    else:
-        obj = dict(_replace_nan(obj))
-        yield safe_json_dumps(obj)
-        yield OpenInferenceMimeTypeValues.JSON.value
+
+    # Handle single-key dictionaries (most common case)
+    if len(obj) == 1:
+        value = next(iter(obj.values()))
+
+        # Optimization: Single string values are returned as-is without processing
+        # This is the most common case in LangChain runs (e.g., {"input": "user message"})
+        if isinstance(value, str):
+            yield value
+            return
+
+        key = next(iter(obj.keys()))
+
+        # Special handling for input/output keys: use custom JSON formatting
+        # that preserves readability and handles edge cases like NaN values
+        if key in ("input", "output"):
+            json_value = _json_dumps(value)
+            yield json_value
+
+            # Conditional MIME type for input/output keys: only structured data gets MIME type
+            # This avoids cluttering simple primitive values with unnecessary MIME type metadata
+            if (
+                json_value.startswith("{")
+                and json_value.endswith("}")
+                or json_value.startswith("[")
+                and json_value.endswith("]")
+            ):
+                yield OpenInferenceMimeTypeValues.JSON.value
+            return
+
+    # Default case: multiple keys or non-input/output keys
+    # These are always complex structured objects, so always include JSON MIME type
+    # Use _json_dumps for consistent formatting across all paths
+    json_value = _json_dumps(obj)
+    yield json_value
+    yield OpenInferenceMimeTypeValues.JSON.value  # Always included for structured objects
 
 
-def _replace_nan(obj: Mapping[str, Any]) -> Iterator[Tuple[str, Any]]:
-    for k, v in obj.items():
-        if isinstance(v, float) and not math.isfinite(v):
-            yield k, None
-        else:
-            yield k, v
+class _OpenInferenceJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder for OpenInference with comprehensive type support."""
+
+    def default(self, obj: Any) -> Any:
+        # Handle Pydantic models
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
+            return obj.model_dump()
+
+        # Handle dataclasses
+        if dataclasses.is_dataclass(obj):
+            # Filter out None optional fields
+            result = {}
+            for field in dataclasses.fields(obj):
+                value = getattr(obj, field.name)
+                if not (
+                    value is None
+                    and get_origin(field.type) is Union
+                    and type(None) in get_args(field.type)
+                ):
+                    result[field.name] = value
+            return result
+
+        # Handle date/time objects
+        if isinstance(obj, (datetime.date, datetime.datetime, datetime.time)):
+            return obj.isoformat()
+
+        # Handle timedeltas as total seconds
+        if isinstance(obj, datetime.timedelta):
+            return obj.total_seconds()
+
+        # Handle UUID, Decimal, Path, complex as strings
+        if isinstance(obj, (UUID, Decimal, PurePath, complex)):
+            return str(obj)
+
+        # Handle Enums by their value
+        if isinstance(obj, Enum):
+            return obj.value
+
+        # Handle sets as lists
+        if isinstance(obj, set):
+            return list(obj)
+
+        # Let the base class handle everything else (will raise TypeError for unsupported types)
+        return super().default(obj)
+
+
+def _json_dumps(obj: Any) -> str:
+    """
+    Simple JSON serialization using standard library with custom encoder.
+
+    This approach is much simpler and more robust than manual recursive processing.
+    It handles most common types while falling back to safe_json_dumps for edge cases.
+    """
+    try:
+        # Use standard json.dumps with our custom encoder
+        return json.dumps(obj, cls=_OpenInferenceJSONEncoder, ensure_ascii=False)
+    except (TypeError, ValueError, OverflowError):
+        # Fallback to safe_json_dumps for any unsupported types or circular references
+        return safe_json_dumps(obj)
 
 
 @stop_on_exception
@@ -359,9 +502,9 @@ def _input_messages(
     # There may be more than one set of messages. We'll use just the first set.
     if not (multiple_messages := inputs.get("messages")):
         return
-    assert isinstance(
-        multiple_messages, Iterable
-    ), f"expected Iterable, found {type(multiple_messages)}"
+    assert isinstance(multiple_messages, Iterable), (
+        f"expected Iterable, found {type(multiple_messages)}"
+    )
     # This will only get the first set of messages.
     if not (first_messages := next(iter(multiple_messages), None)):
         return
@@ -378,6 +521,10 @@ def _input_messages(
         parsed_messages.append(dict(_parse_message_data(first_messages.to_json())))
     elif hasattr(first_messages, "get"):
         parsed_messages.append(dict(_parse_message_data(first_messages)))
+    elif isinstance(first_messages, Sequence) and len(first_messages) == 2:
+        # See e.g. https://github.com/langchain-ai/langchain/blob/18cf457eec106d99e0098b42712299f5d0daa798/libs/core/langchain_core/messages/utils.py#L317  # noqa: E501
+        role, content = first_messages
+        parsed_messages.append({MESSAGE_ROLE: role, MESSAGE_CONTENT: content})
     else:
         raise ValueError(f"failed to parse messages of type {type(first_messages)}")
     if parsed_messages:
@@ -395,15 +542,15 @@ def _output_messages(
     # There may be more than one set of generations. We'll use just the first set.
     if not (multiple_generations := outputs.get("generations")):
         return
-    assert isinstance(
-        multiple_generations, Iterable
-    ), f"expected Iterable, found {type(multiple_generations)}"
+    assert isinstance(multiple_generations, Iterable), (
+        f"expected Iterable, found {type(multiple_generations)}"
+    )
     # This will only get the first set of generations.
     if not (first_generations := next(iter(multiple_generations), None)):
         return
-    assert isinstance(
-        first_generations, Iterable
-    ), f"expected Iterable, found {type(first_generations)}"
+    assert isinstance(first_generations, Iterable), (
+        f"expected Iterable, found {type(first_generations)}"
+    )
     parsed_messages = []
     for generation in first_generations:
         assert hasattr(generation, "get"), f"expected Mapping, found {type(generation)}"
@@ -419,8 +566,7 @@ def _output_messages(
 
 
 @stop_on_exception
-def _parse_message_data(message_data: Optional[Mapping[str, Any]]) -> Iterator[Tuple[str, Any]]:
-    """Parses message data to grab message role, content, etc."""
+def _extract_message_role(message_data: Optional[Mapping[str, Any]]) -> Iterator[Tuple[str, Any]]:
     if not message_data:
         return
     assert hasattr(message_data, "get"), f"expected Mapping, found {type(message_data)}"
@@ -442,6 +588,13 @@ def _parse_message_data(message_data: Optional[Mapping[str, Any]]) -> Iterator[T
     else:
         raise ValueError(f"Cannot parse message of type: {message_class_name}")
     yield MESSAGE_ROLE, role
+
+
+@stop_on_exception
+def _extract_message_kwargs(message_data: Optional[Mapping[str, Any]]) -> Iterator[Tuple[str, Any]]:
+    if not message_data:
+        return
+    assert hasattr(message_data, "get"), f"expected Mapping, found {type(message_data)}"
     if kwargs := message_data.get("kwargs"):
         assert hasattr(kwargs, "get"), f"expected Mapping, found {type(kwargs)}"
         if content := kwargs.get("content"):
@@ -449,33 +602,95 @@ def _parse_message_data(message_data: Optional[Mapping[str, Any]]) -> Iterator[T
                 yield MESSAGE_CONTENT, content
             elif isinstance(content, list):
                 for i, obj in enumerate(content):
+                    if isinstance(obj, str):
+                        yield f"{MESSAGE_CONTENTS}.{i}.{MESSAGE_CONTENT_TEXT}", obj
+                        continue
                     assert hasattr(obj, "get"), f"expected Mapping, found {type(obj)}"
                     for k, v in _get_attributes_from_message_content(obj):
                         yield f"{MESSAGE_CONTENTS}.{i}.{k}", v
+        if tool_call_id := kwargs.get("tool_call_id"):
+            assert isinstance(tool_call_id, str), f"expected str, found {type(tool_call_id)}"
+            yield MESSAGE_TOOL_CALL_ID, tool_call_id
+        if name := kwargs.get("name"):
+            assert isinstance(name, str), f"expected str, found {type(name)}"
+            yield MESSAGE_NAME, name
+
+
+@stop_on_exception
+def _extract_message_additional_kwargs(
+    message_data: Optional[Mapping[str, Any]],
+) -> Iterator[Tuple[str, Any]]:
+    if not message_data:
+        return
+    assert hasattr(message_data, "get"), f"expected Mapping, found {type(message_data)}"
+    if kwargs := message_data.get("kwargs"):
+        assert hasattr(kwargs, "get"), f"expected Mapping, found {type(kwargs)}"
         if additional_kwargs := kwargs.get("additional_kwargs"):
-            assert hasattr(
-                additional_kwargs, "get"
-            ), f"expected Mapping, found {type(additional_kwargs)}"
+            assert hasattr(additional_kwargs, "get"), (
+                f"expected Mapping, found {type(additional_kwargs)}"
+            )
             if function_call := additional_kwargs.get("function_call"):
-                assert hasattr(
-                    function_call, "get"
-                ), f"expected Mapping, found {type(function_call)}"
+                assert hasattr(function_call, "get"), (
+                    f"expected Mapping, found {type(function_call)}"
+                )
                 if name := function_call.get("name"):
                     assert isinstance(name, str), f"expected str, found {type(name)}"
                     yield MESSAGE_FUNCTION_CALL_NAME, name
                 if arguments := function_call.get("arguments"):
-                    assert isinstance(arguments, str), f"expected str, found {type(arguments)}"
-                    yield MESSAGE_FUNCTION_CALL_ARGUMENTS_JSON, arguments
+                    if isinstance(arguments, str):
+                        yield MESSAGE_FUNCTION_CALL_ARGUMENTS_JSON, arguments
+                    else:
+                        yield MESSAGE_FUNCTION_CALL_ARGUMENTS_JSON, safe_json_dumps(arguments)
+
+
+def _process_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+    """Helper function to process tool calls from any source."""
+    if not tool_calls:
+        return []
+    assert isinstance(tool_calls, Iterable), f"expected Iterable, found {type(tool_calls)}"
+    message_tool_calls = []
+    for tool_call in tool_calls:
+        if message_tool_call := dict(_get_tool_call(tool_call)):
+            message_tool_calls.append(message_tool_call)
+    return message_tool_calls
+
+
+@stop_on_exception
+def _extract_message_tool_calls(
+    message_data: Optional[Mapping[str, Any]],
+) -> Iterator[Tuple[str, Any]]:
+    if not message_data:
+        return
+    assert hasattr(message_data, "get"), f"expected Mapping, found {type(message_data)}"
+    if tool_calls := message_data.get("tool_calls"):
+        # https://github.com/langchain-ai/langgraph/blob/86017c010c7901f7971d1ac499c392a0652f63cc/libs/langgraph/langgraph/graph/message.py#L266# noqa: E501
+        message_tool_calls = _process_tool_calls(tool_calls)
+        if message_tool_calls:
+            yield MESSAGE_TOOL_CALLS, message_tool_calls
+    if kwargs := message_data.get("kwargs"):
+        assert hasattr(kwargs, "get"), f"expected Mapping, found {type(kwargs)}"
+        if tool_calls := kwargs.get("tool_calls"):
+            # https://github.com/langchain-ai/langchain/blob/a7d0e42f3fa5b147fea9109f60e799229f30a68b/libs/core/langchain_core/messages/ai.py#L167  # noqa: E501
+            message_tool_calls = _process_tool_calls(tool_calls)
+            if message_tool_calls:
+                yield MESSAGE_TOOL_CALLS, message_tool_calls
+        if additional_kwargs := kwargs.get("additional_kwargs"):
+            assert hasattr(additional_kwargs, "get"), (
+                f"expected Mapping, found {type(additional_kwargs)}"
+            )
             if tool_calls := additional_kwargs.get("tool_calls"):
-                assert isinstance(
-                    tool_calls, Iterable
-                ), f"expected Iterable, found {type(tool_calls)}"
-                message_tool_calls = []
-                for tool_call in tool_calls:
-                    if message_tool_call := dict(_get_tool_call(tool_call)):
-                        message_tool_calls.append(message_tool_call)
+                message_tool_calls = _process_tool_calls(tool_calls)
                 if message_tool_calls:
                     yield MESSAGE_TOOL_CALLS, message_tool_calls
+
+
+@stop_on_exception
+def _parse_message_data(message_data: Optional[Mapping[str, Any]]) -> Iterator[Tuple[str, Any]]:
+    """Parses message data to grab message role, content, etc."""
+    yield from _extract_message_role(message_data)
+    yield from _extract_message_kwargs(message_data)
+    yield from _extract_message_additional_kwargs(message_data)
+    yield from _extract_message_tool_calls(message_data)
 
 
 @stop_on_exception
@@ -483,14 +698,28 @@ def _get_tool_call(tool_call: Optional[Mapping[str, Any]]) -> Iterator[Tuple[str
     if not tool_call:
         return
     assert hasattr(tool_call, "get"), f"expected Mapping, found {type(tool_call)}"
+    if (id_ := tool_call.get("id")) is not None:
+        yield TOOL_CALL_ID, id_
     if function := tool_call.get("function"):
         assert hasattr(function, "get"), f"expected Mapping, found {type(function)}"
         if name := function.get("name"):
             assert isinstance(name, str), f"expected str, found {type(name)}"
             yield TOOL_CALL_FUNCTION_NAME, name
         if arguments := function.get("arguments"):
-            assert isinstance(arguments, str), f"expected str, found {type(arguments)}"
-            yield TOOL_CALL_FUNCTION_ARGUMENTS_JSON, arguments
+            if isinstance(arguments, str):
+                yield TOOL_CALL_FUNCTION_ARGUMENTS_JSON, arguments
+            else:
+                yield TOOL_CALL_FUNCTION_ARGUMENTS_JSON, safe_json_dumps(arguments)
+    else:
+        # https://github.com/langchain-ai/langchain/blob/a7d0e42f3fa5b147fea9109f60e799229f30a68b/libs/core/langchain_core/messages/tool.py#L179  # noqa: E501
+        if name := tool_call.get("name"):
+            assert isinstance(name, str), f"expected str, found {type(name)}"
+            yield TOOL_CALL_FUNCTION_NAME, name
+        if arguments := tool_call.get("args"):
+            if isinstance(arguments, str):
+                yield TOOL_CALL_FUNCTION_ARGUMENTS_JSON, arguments
+            else:
+                yield TOOL_CALL_FUNCTION_ARGUMENTS_JSON, safe_json_dumps(arguments)
 
 
 @stop_on_exception
@@ -520,9 +749,9 @@ def _parse_prompt_template(
         message = messages[0]
         assert isinstance(message, Mapping), f"expected dict, found {type(message)}"
         if partial_variables := kwargs.get("partial_variables"):
-            assert isinstance(
-                partial_variables, Mapping
-            ), f"expected dict, found {type(partial_variables)}"
+            assert isinstance(partial_variables, Mapping), (
+                f"expected dict, found {type(partial_variables)}"
+            )
             inputs = {**partial_variables, **inputs}
         yield from _parse_prompt_template(inputs, message)
     elif _get_cls_name(serialized).endswith("PromptTemplate") and isinstance(
@@ -530,9 +759,9 @@ def _parse_prompt_template(
     ):
         yield LLM_PROMPT_TEMPLATE, template
         if input_variables := kwargs.get("input_variables"):
-            assert isinstance(
-                input_variables, list
-            ), f"expected list, found {type(input_variables)}"
+            assert isinstance(input_variables, list), (
+                f"expected list, found {type(input_variables)}"
+            )
             template_variables = {}
             for variable in input_variables:
                 if (value := inputs.get(variable)) is not None:
@@ -550,18 +779,51 @@ def _invocation_parameters(run: Run) -> Iterator[Tuple[str, str]]:
         return
     assert hasattr(extra, "get"), f"expected Mapping, found {type(extra)}"
     if invocation_parameters := extra.get("invocation_params"):
-        assert isinstance(
-            invocation_parameters, Mapping
-        ), f"expected Mapping, found {type(invocation_parameters)}"
+        assert isinstance(invocation_parameters, Mapping), (
+            f"expected Mapping, found {type(invocation_parameters)}"
+        )
         yield LLM_INVOCATION_PARAMETERS, safe_json_dumps(invocation_parameters)
+        tools = invocation_parameters.get("tools", [])
+        for idx, tool in enumerate(tools):
+            yield f"{LLM_TOOLS}.{idx}.{TOOL_JSON_SCHEMA}", safe_json_dumps(tool)
 
 
 @stop_on_exception
-def _model_name(extra: Optional[Mapping[str, Any]]) -> Iterator[Tuple[str, str]]:
+def _llm_provider(extra: Optional[Mapping[str, Any]]) -> Iterator[Tuple[str, str]]:
+    if not extra:
+        return
+    if (meta := extra.get("metadata")) and (ls_provider := meta.get("ls_provider")):
+        ls_provider_lower = ls_provider.lower()
+        yield LLM_PROVIDER, _LANGCHAIN_PROVIDER_MAP.get(ls_provider_lower) or ls_provider_lower
+
+
+@stop_on_exception
+def _model_name(
+    outputs: Optional[Mapping[str, Any]],
+    extra: Optional[Mapping[str, Any]],
+) -> Iterator[Tuple[str, str]]:
     """Yields model name if present."""
+    if (
+        outputs
+        and hasattr(outputs, "get")
+        and (llm_output := outputs.get("llm_output"))
+        and hasattr(llm_output, "get")
+    ):
+        for key in "model_name", "model":
+            if name := str(llm_output.get(key) or "").strip():
+                yield LLM_MODEL_NAME, name
+                return
     if not extra:
         return
     assert hasattr(extra, "get"), f"expected Mapping, found {type(extra)}"
+    if (
+        (metadata := extra.get("metadata"))
+        and hasattr(metadata, "get")
+        and (ls_model_name := str(metadata.get("ls_model_name") or "").strip())
+    ):
+        # See https://github.com/langchain-ai/langchain/blob/404d8408f40d86701d7fff81b039b7c76f77153e/libs/core/langchain_core/language_models/base.py#L44  # noqa: E501
+        yield LLM_MODEL_NAME, ls_model_name
+        return
     if not (invocation_params := extra.get("invocation_params")):
         return
     for key in ["model_name", "model"]:
@@ -599,9 +861,38 @@ def _token_counts(outputs: Optional[Mapping[str, Any]]) -> Iterator[Tuple[str, i
             ),
         ),
         (LLM_TOKEN_COUNT_TOTAL, ("total_tokens", "total_token_count")),  # Gemini-specific key
+        (LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ, ("cache_read_input_tokens",)),  # Antrhopic
+        (LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE, ("cache_creation_input_tokens",)),  # Antrhopic
     ]:
         if (token_count := _get_first_value(token_usage, keys)) is not None:
             yield attribute_name, token_count
+
+    # OpenAI
+    for attribute_name, details_key, keys in [
+        (
+            LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO,
+            "completion_tokens_details",
+            ("audio_tokens",),
+        ),
+        (
+            LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING,
+            "completion_tokens_details",
+            ("reasoning_tokens",),
+        ),
+        (
+            LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO,
+            "prompt_tokens_details",
+            ("audio_tokens",),
+        ),
+        (
+            LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ,
+            "prompt_tokens_details",
+            ("cached_tokens",),
+        ),
+    ]:
+        if (details := token_usage.get(details_key)) is not None:
+            if (token_count := _get_first_value(details, keys)) is not None:
+                yield attribute_name, token_count
 
 
 def _parse_token_usage_for_vertexai(
@@ -740,6 +1031,14 @@ def _metadata(run: Run) -> Iterator[Tuple[str, str]]:
         or metadata.get(LANGCHAIN_THREAD_ID)
     ):
         yield SESSION_ID, session_id
+    if isinstance((ctx_metadata_str := get_value(SpanAttributes.METADATA)), str):
+        try:
+            ctx_metadata = json.loads(ctx_metadata_str)
+        except Exception:
+            pass
+        else:
+            if isinstance(ctx_metadata, Mapping):
+                metadata = {**ctx_metadata, **metadata}
     yield METADATA, safe_json_dumps(metadata)
 
 
@@ -753,8 +1052,8 @@ def _as_document(document: Any) -> Iterator[Tuple[str, Any]]:
         yield DOCUMENT_METADATA, safe_json_dumps(metadata)
 
 
-def _as_utc_nano(dt: datetime) -> int:
-    return int(dt.astimezone(timezone.utc).timestamp() * 1_000_000_000)
+def _as_utc_nano(dt: datetime.datetime) -> int:
+    return int(dt.astimezone(datetime.timezone.utc).timestamp() * 1_000_000_000)
 
 
 def _get_cls_name(serialized: Optional[Mapping[str, Any]]) -> str:
@@ -839,7 +1138,16 @@ LLM_PROMPTS = SpanAttributes.LLM_PROMPTS
 LLM_PROMPT_TEMPLATE = SpanAttributes.LLM_PROMPT_TEMPLATE
 LLM_PROMPT_TEMPLATE_VARIABLES = SpanAttributes.LLM_PROMPT_TEMPLATE_VARIABLES
 LLM_TOKEN_COUNT_COMPLETION = SpanAttributes.LLM_TOKEN_COUNT_COMPLETION
+LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO = SpanAttributes.LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO
+LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING = (
+    SpanAttributes.LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING
+)
 LLM_TOKEN_COUNT_PROMPT = SpanAttributes.LLM_TOKEN_COUNT_PROMPT
+LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE = (
+    SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE
+)
+LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ = SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ
+LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO = SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO
 LLM_TOKEN_COUNT_TOTAL = SpanAttributes.LLM_TOKEN_COUNT_TOTAL
 MESSAGE_CONTENT = MessageAttributes.MESSAGE_CONTENT
 MESSAGE_CONTENTS = MessageAttributes.MESSAGE_CONTENTS
@@ -851,6 +1159,7 @@ MESSAGE_FUNCTION_CALL_NAME = MessageAttributes.MESSAGE_FUNCTION_CALL_NAME
 MESSAGE_NAME = MessageAttributes.MESSAGE_NAME
 MESSAGE_ROLE = MessageAttributes.MESSAGE_ROLE
 MESSAGE_TOOL_CALLS = MessageAttributes.MESSAGE_TOOL_CALLS
+MESSAGE_TOOL_CALL_ID = MessageAttributes.MESSAGE_TOOL_CALL_ID
 METADATA = SpanAttributes.METADATA
 OPENINFERENCE_SPAN_KIND = SpanAttributes.OPENINFERENCE_SPAN_KIND
 OUTPUT_MIME_TYPE = SpanAttributes.OUTPUT_MIME_TYPE
@@ -864,6 +1173,85 @@ RETRIEVAL_DOCUMENTS = SpanAttributes.RETRIEVAL_DOCUMENTS
 SESSION_ID = SpanAttributes.SESSION_ID
 TOOL_CALL_FUNCTION_ARGUMENTS_JSON = ToolCallAttributes.TOOL_CALL_FUNCTION_ARGUMENTS_JSON
 TOOL_CALL_FUNCTION_NAME = ToolCallAttributes.TOOL_CALL_FUNCTION_NAME
+TOOL_CALL_ID = ToolCallAttributes.TOOL_CALL_ID
 TOOL_DESCRIPTION = SpanAttributes.TOOL_DESCRIPTION
 TOOL_NAME = SpanAttributes.TOOL_NAME
 TOOL_PARAMETERS = SpanAttributes.TOOL_PARAMETERS
+TOOL_JSON_SCHEMA = ToolAttributes.TOOL_JSON_SCHEMA
+LLM_TOOLS = SpanAttributes.LLM_TOOLS
+LLM_SYSTEM = SpanAttributes.LLM_SYSTEM
+LLM_PROVIDER = SpanAttributes.LLM_PROVIDER
+
+_NA = None
+
+# Map provider to system value
+_PROVIDER_TO_SYSTEM = {
+    "anthropic": OpenInferenceLLMSystemValues.ANTHROPIC.value,
+    "azure": OpenInferenceLLMSystemValues.OPENAI.value,
+    "azure_ai": OpenInferenceLLMSystemValues.OPENAI.value,
+    "azure_openai": OpenInferenceLLMSystemValues.OPENAI.value,
+    "bedrock": _NA,  # TODO
+    "bedrock_converse": _NA,  # TODO
+    "cohere": OpenInferenceLLMSystemValues.COHERE.value,
+    "deepseek": _NA,  # TODO
+    "fireworks": _NA,  # TODO
+    "google": OpenInferenceLLMSystemValues.VERTEXAI.value,
+    "google_anthropic_vertex": OpenInferenceLLMSystemValues.ANTHROPIC.value,
+    "google_genai": OpenInferenceLLMSystemValues.VERTEXAI.value,
+    "google_vertexai": OpenInferenceLLMSystemValues.VERTEXAI.value,
+    "groq": OpenInferenceLLMSystemValues.OPENAI.value,
+    "huggingface": _NA,  # TODO
+    "ibm": _NA,  # TODO
+    "mistralai": OpenInferenceLLMSystemValues.MISTRALAI.value,
+    "ollama": OpenInferenceLLMSystemValues.OPENAI.value,
+    "openai": OpenInferenceLLMSystemValues.OPENAI.value,
+    "perplexity": _NA,  # TODO
+    "together": _NA,  # TODO
+    "vertex": OpenInferenceLLMSystemValues.VERTEXAI.value,
+    "vertexai": OpenInferenceLLMSystemValues.VERTEXAI.value,
+    "xai": _NA,  # TODO
+}
+
+# Map LangChain provider names to OpenInference provider values
+_LANGCHAIN_PROVIDER_MAP = {
+    "anthropic": OpenInferenceLLMProviderValues.ANTHROPIC.value,
+    "azure": OpenInferenceLLMProviderValues.AZURE.value,
+    "azure_ai": OpenInferenceLLMProviderValues.AZURE.value,
+    "azure_openai": OpenInferenceLLMProviderValues.AZURE.value,
+    "bedrock": OpenInferenceLLMProviderValues.AWS.value,
+    "bedrock_converse": OpenInferenceLLMProviderValues.AWS.value,
+    "cohere": OpenInferenceLLMProviderValues.COHERE.value,
+    "deepseek": OpenInferenceLLMProviderValues.DEEPSEEK.value,
+    "fireworks": "fireworks",
+    "google": OpenInferenceLLMProviderValues.GOOGLE.value,
+    "google_anthropic_vertex": OpenInferenceLLMProviderValues.GOOGLE.value,
+    "google_genai": OpenInferenceLLMProviderValues.GOOGLE.value,
+    "google_vertexai": OpenInferenceLLMProviderValues.GOOGLE.value,
+    "groq": "groq",
+    "huggingface": "huggingface",
+    "ibm": "ibm",
+    "mistralai": OpenInferenceLLMProviderValues.MISTRALAI.value,
+    "nvidia": "nvidia",
+    "ollama": "ollama",
+    "openai": OpenInferenceLLMProviderValues.OPENAI.value,
+    "perplexity": "perplexity",
+    "together": "together",
+    "vertex": OpenInferenceLLMProviderValues.GOOGLE.value,
+    "vertexai": OpenInferenceLLMProviderValues.GOOGLE.value,
+    "xai": OpenInferenceLLMProviderValues.XAI.value,
+}
+
+
+@stop_on_exception
+def _llm_system(extra: Optional[Mapping[str, Any]]) -> Iterator[Tuple[str, str]]:
+    """
+    Extract the LLM system (AI product) from the extra information in a LangChain run.
+
+    Derives the system from the ls_provider in metadata, which is LangChain's source of truth.
+    """
+    if not extra:
+        return
+    if (meta := extra.get("metadata")) and (ls_provider := meta.get("ls_provider")):
+        ls_provider_lower = ls_provider.lower()
+        if system := _PROVIDER_TO_SYSTEM.get(ls_provider_lower):
+            yield LLM_SYSTEM, system

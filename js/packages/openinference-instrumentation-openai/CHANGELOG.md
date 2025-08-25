@@ -1,5 +1,102 @@
 # @arizeai/openinference-instrumentation-openai
 
+## 3.2.2
+
+### Patch Changes
+
+- Updated dependencies [9d3bdb4]
+  - @arizeai/openinference-core@1.0.6
+
+## 3.2.1
+
+### Patch Changes
+
+- Updated dependencies [59be946]
+  - @arizeai/openinference-semantic-conventions@2.1.1
+  - @arizeai/openinference-core@1.0.5
+
+## 3.2.0
+
+### Minor Changes
+
+- e211094: add ability to use a non-global trace provider
+
+## 3.1.1
+
+### Patch Changes
+
+- Updated dependencies [34a4159]
+  - @arizeai/openinference-semantic-conventions@2.1.0
+  - @arizeai/openinference-core@1.0.4
+
+## 3.1.0
+
+### Minor Changes
+
+- c9b96a7: feat: Add support for responses.parse and chat.parse method instrumentation
+
+## 3.0.0
+
+### Major Changes
+
+- 35f7b0e: feat: Add support for openai-node sdk 5.x
+
+  Support for openai@4.x has been dropped. Please upgrade to openai@5.x to continue using this package.
+
+## 2.3.1
+
+### Patch Changes
+
+- Updated dependencies [c2ee804]
+- Updated dependencies [5f904bf]
+- Updated dependencies [5f90a80]
+  - @arizeai/openinference-semantic-conventions@2.0.0
+  - @arizeai/openinference-core@1.0.3
+
+## 2.3.0
+
+### Minor Changes
+
+- 5207deb: feat(openai-js): Instrument OpenAI responses sdk
+
+## 2.2.0
+
+### Minor Changes
+
+- e5300f3: support for prompt and completion token count details for langchainjs and openai
+
+## 2.1.0
+
+### Minor Changes
+
+- 5aa6511: fix(openai): Rewrite namespace import to default import in support of ESM projects
+
+### Patch Changes
+
+- Updated dependencies [ae5cd15]
+  - @arizeai/openinference-semantic-conventions@1.1.0
+  - @arizeai/openinference-core@1.0.2
+
+## 2.0.3
+
+### Patch Changes
+
+- Updated dependencies [c4e2252]
+  - @arizeai/openinference-semantic-conventions@1.0.1
+  - @arizeai/openinference-core@1.0.1
+
+## 2.0.2
+
+### Patch Changes
+
+- f1c1a3c: place image attributes under the right path
+
+## 2.0.1
+
+### Patch Changes
+
+- b69cca6: Account for developer role in the openai instrumentation
+
 ## 2.0.0
 
 ### Major Changes

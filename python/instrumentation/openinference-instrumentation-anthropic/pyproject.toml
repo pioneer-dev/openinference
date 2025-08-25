@@ -28,15 +28,15 @@ dependencies = [
     "opentelemetry-api",
     "opentelemetry-instrumentation",
     "opentelemetry-semantic-conventions",
-    "openinference-instrumentation>=0.1.17",
-    "openinference-semantic-conventions",
+    "openinference-instrumentation>=0.1.27",
+    "openinference-semantic-conventions>=0.1.17",
     "wrapt",
     "typing-extensions",
 ]
 
 [project.optional-dependencies]
 instruments = [
-    "anthropic >= 0.30.0",
+    "anthropic >= 0.41.0",
 ]
 
 [project.entry-points.opentelemetry_instrumentor]

@@ -28,8 +28,8 @@ dependencies = [
     "opentelemetry-api",
     "opentelemetry-instrumentation",
     "opentelemetry-semantic-conventions",
-    "openinference-instrumentation>=0.1.17",
-    "openinference-semantic-conventions",
+    "openinference-instrumentation>=0.1.27",
+    "openinference-semantic-conventions>=0.1.17",
     "wrapt",
     "typing-extensions",
 ]
@@ -37,10 +37,10 @@ dependencies = [
 
 [project.optional-dependencies]
 instruments = [
-    "haystack-ai >= 2.10.0",
+    "haystack-ai >= 2.13.0",
 ]
 test = [
-    "haystack-ai==2.10.0",
+    "haystack-ai==2.13.0",
     "cohere-haystack",
     "opentelemetry-sdk",
     "vcrpy>=7.0.0",

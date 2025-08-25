@@ -16,6 +16,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AsyncGenerator,
+    Callable,
     DefaultDict,
     Dict,
     Generator,
@@ -40,7 +41,20 @@ from pydantic.v1.json import pydantic_encoder
 from typing_extensions import assert_never
 
 from llama_index.core import QueryBundle
-from llama_index.core.base.agent.types import BaseAgent, BaseAgentWorker
+
+# Conditionally import agent base classes (they may not exist in all versions)
+try:
+    from llama_index.core.agent import BaseAgent, BaseAgentWorker  # type: ignore[attr-defined]
+except ImportError:
+    # Fallback for older versions
+    try:
+        from llama_index.core.base.agent.types import (  # type: ignore[import-not-found]
+            BaseAgent,
+            BaseAgentWorker,
+        )
+    except ImportError:
+        BaseAgent = None  # type: ignore[misc,assignment]
+        BaseAgentWorker = None  # type: ignore[misc,assignment]
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.base.llms.base import BaseLLM
@@ -48,6 +62,9 @@ from llama_index.core.base.llms.types import (
     ChatMessage,
     ChatResponse,
     CompletionResponse,
+    ContentBlock,
+    ImageBlock,
+    TextBlock,
 )
 from llama_index.core.base.response.schema import (
     RESPONSE_TYPE,
@@ -97,7 +114,7 @@ from llama_index.core.instrumentation.events.retrieval import (
     RetrievalEndEvent,
     RetrievalStartEvent,
 )
-from llama_index.core.instrumentation.events.span import SpanDropEvent
+from llama_index.core.instrumentation.events.span import SpanDropEvent  # type: ignore[attr-defined]
 from llama_index.core.instrumentation.events.synthesis import (
     GetResponseEndEvent,
     GetResponseStartEvent,
@@ -110,7 +127,7 @@ from llama_index.core.multi_modal_llms import MultiModalLLM
 from llama_index.core.schema import BaseNode, NodeWithScore, QueryType
 from llama_index.core.tools import BaseTool
 from llama_index.core.types import RESPONSE_TEXT_TYPE
-from llama_index.core.workflow.errors import WorkflowDone
+from llama_index.core.workflow.errors import WorkflowDone  # type: ignore[attr-defined]
 from openinference.instrumentation import (
     get_attributes_from_context,
     safe_json_dumps,
@@ -121,10 +138,13 @@ from openinference.semconv.trace import (
     ImageAttributes,
     MessageAttributes,
     MessageContentAttributes,
+    OpenInferenceLLMProviderValues,
+    OpenInferenceLLMSystemValues,
     OpenInferenceMimeTypeValues,
     OpenInferenceSpanKindValues,
     RerankerAttributes,
     SpanAttributes,
+    ToolAttributes,
     ToolCallAttributes,
 )
 
@@ -152,6 +172,122 @@ if LLAMA_INDEX_VERSION < (0, 10, 44):
 
 elif not TYPE_CHECKING:
     from llama_index.core.instrumentation.events.exception import ExceptionEvent
+
+
+def _detect_llm_provider(instance: Any) -> Optional[str]:
+    """
+    Detect LLM provider using lazy imports to avoid import errors when
+    optional LLM provider packages are not installed.
+
+    Args:
+        instance: The LLM instance to check
+
+    Returns:
+        Provider string if detected, None otherwise
+    """
+    # Try specific provider imports with lazy loading
+    try:
+        from llama_index.llms.openai import OpenAI as LlamaIndexOpenAI
+
+        if isinstance(instance, LlamaIndexOpenAI):
+            return OpenInferenceLLMProviderValues.OPENAI.value
+    except ImportError:
+        pass
+
+    try:
+        from llama_index.llms.anthropic import Anthropic as LlamaIndexAnthropic
+
+        if isinstance(instance, LlamaIndexAnthropic):
+            return OpenInferenceLLMProviderValues.ANTHROPIC.value
+    except ImportError:
+        pass
+
+    try:
+        from llama_index.llms.azure_openai import AzureOpenAI as LlamaIndexAzureOpenAI
+
+        if isinstance(instance, LlamaIndexAzureOpenAI):
+            return OpenInferenceLLMProviderValues.AZURE.value
+    except ImportError:
+        pass
+
+    try:
+        from llama_index.llms.vertex import Vertex as LlamaIndexVertex
+
+        if isinstance(instance, LlamaIndexVertex):
+            return OpenInferenceLLMProviderValues.GOOGLE.value
+    except ImportError:
+        pass
+
+    # Fallback: check class name if imports fail
+    class_name = instance.__class__.__name__.lower()
+    if "openai" in class_name:
+        if "azure" in class_name:
+            return OpenInferenceLLMProviderValues.AZURE.value
+        return OpenInferenceLLMProviderValues.OPENAI.value
+    elif "anthropic" in class_name:
+        return OpenInferenceLLMProviderValues.ANTHROPIC.value
+    elif "vertex" in class_name or "gemini" in class_name:
+        return OpenInferenceLLMProviderValues.GOOGLE.value
+
+    return None
+
+
+def _detect_llm_system(instance: Any) -> Optional[str]:
+    """
+    Detect LLM system (AI product) using lazy imports to avoid import errors when
+    optional LLM provider packages are not installed.
+
+    Args:
+        instance: The LLM instance to check
+
+    Returns:
+        System string if detected, None otherwise
+    """
+    # Try specific system imports with lazy loading
+    try:
+        from llama_index.llms.openai import OpenAI as LlamaIndexOpenAI
+
+        if isinstance(instance, LlamaIndexOpenAI):
+            return OpenInferenceLLMSystemValues.OPENAI.value
+    except ImportError:
+        pass
+
+    try:
+        from llama_index.llms.azure_openai import AzureOpenAI as LlamaIndexAzureOpenAI
+
+        if isinstance(instance, LlamaIndexAzureOpenAI):
+            return OpenInferenceLLMSystemValues.OPENAI.value  # Azure OpenAI uses OpenAI's system
+    except ImportError:
+        pass
+
+    try:
+        from llama_index.llms.anthropic import Anthropic as LlamaIndexAnthropic
+
+        if isinstance(instance, LlamaIndexAnthropic):
+            return OpenInferenceLLMSystemValues.ANTHROPIC.value
+    except ImportError:
+        pass
+
+    try:
+        from llama_index.llms.vertex import Vertex as LlamaIndexVertex
+
+        if isinstance(instance, LlamaIndexVertex):
+            return OpenInferenceLLMSystemValues.VERTEXAI.value
+    except ImportError:
+        pass
+
+    # Fallback: check class name if imports fail
+    class_name = instance.__class__.__name__.lower()
+    if "openai" in class_name:
+        return (
+            OpenInferenceLLMSystemValues.OPENAI.value
+        )  # Both OpenAI and Azure OpenAI use OpenAI system
+    elif "anthropic" in class_name:
+        return OpenInferenceLLMSystemValues.ANTHROPIC.value
+    elif "vertex" in class_name or "gemini" in class_name:
+        return OpenInferenceLLMSystemValues.VERTEXAI.value
+
+    return None
 
 
 class _StreamingStatus(Enum):
@@ -225,6 +361,13 @@ class _Span(BaseSpan):
         return set_span_in_context(self._otel_span)
 
     def process_input(self, instance: Any, bound_args: inspect.BoundArguments) -> None:
+        from llama_index.core.llms.function_calling import FunctionCallingLLM
+
+        if isinstance(instance, FunctionCallingLLM) and isinstance(
+            (tools := bound_args.kwargs.get("tools")), Iterable
+        ):
+            for i, tool in enumerate(tools):
+                self[f"{LLM_TOOLS}.{i}.{TOOL_JSON_SCHEMA}"] = safe_json_dumps(tool)
         try:
             self[INPUT_VALUE] = safe_json_dumps(
                 bound_args.arguments, cls=_Encoder)
@@ -256,9 +399,11 @@ class _Span(BaseSpan):
                 self[OUTPUT_VALUE] = result.model_dump_json(
                     exclude_unset=True, exclude={"retriever"})
                 self[OUTPUT_MIME_TYPE] = JSON
-            except BaseException as e:
-                logger.exception(str(e))
-                pass
+            except Exception:
+                try:
+                    self[OUTPUT_VALUE] = repr(result)
+                except Exception:
+                    pass
         else:
             try:
                 self[OUTPUT_VALUE] = safe_json_dumps(result, cls=_Encoder)
@@ -276,6 +421,14 @@ class _Span(BaseSpan):
         if metadata := instance.metadata:
             self[LLM_MODEL_NAME] = metadata.model_name
             self[LLM_INVOCATION_PARAMETERS] = metadata.json(exclude_unset=True)
+
+        # Add LLM provider detection
+        if provider := _detect_llm_provider(instance):
+            self[LLM_PROVIDER] = provider
+
+        # Add LLM system detection
+        if system := _detect_llm_system(instance):
+            self[LLM_SYSTEM] = system
 
     @process_instance.register
     def _(self, instance: BaseEmbedding) -> None:
@@ -535,23 +688,34 @@ class _Span(BaseSpan):
         self._process_response_text_type(event.response)
 
     def _extract_token_counts(self, response: Union[ChatResponse, CompletionResponse]) -> None:
-        if (
-            (raw := getattr(response, "raw", None))
-            and hasattr(raw, "get")
-            and (usage := raw.get("usage"))
-        ):
-            for k, v in _get_token_counts(usage):
-                self[k] = v
-        if (
-            (raw := getattr(response, "raw", None))
-            and (model_extra := getattr(raw, "model_extra", None))
-            and hasattr(model_extra, "get")
-            and (x_groq := model_extra.get("x_groq"))
-            and hasattr(x_groq, "get")
-            and (usage := x_groq.get("usage"))
-        ):
-            for k, v in _get_token_counts(usage):
-                self[k] = v
+        if raw := getattr(response, "raw", None):
+            usage = raw.get("usage") if isinstance(raw, Mapping) else getattr(raw, "usage", None)
+            if usage:
+                for k, v in _get_token_counts(usage):
+                    self[k] = v
+            if (
+                (model_extra := getattr(raw, "model_extra", None))
+                and hasattr(model_extra, "get")
+                and (x_groq := model_extra.get("x_groq"))
+                and hasattr(x_groq, "get")
+                and (usage := x_groq.get("usage"))
+            ):
+                for k, v in _get_token_counts(usage):
+                    self[k] = v
+
+            # Check for VertexAI usage_metadata
+            # VertexAI stores usage_metadata inside _raw_response
+            if isinstance(raw, Mapping) and (raw_response := raw.get("_raw_response")):
+                usage_metadata = (
+                    raw_response.get("usage_metadata")
+                    if isinstance(raw_response, Mapping)
+                    else getattr(raw_response, "usage_metadata", None)
+                )
+            else:
+                usage_metadata = getattr(raw, "usage_metadata", None)
+            if usage_metadata:
+                for k, v in _get_token_counts(usage_metadata):
+                    self[k] = v
         # Look for token counts in additional_kwargs of the completion payload
         # This is needed for non-OpenAI models
         if additional_kwargs := getattr(response, "additional_kwargs", None):
@@ -576,15 +740,16 @@ class _Span(BaseSpan):
     ) -> None:
         for i, message in enumerate(messages):
             self[f"{prefix}.{i}.{MESSAGE_ROLE}"] = message.role.value
-            if content := message.content:
-                if isinstance(content, str):
-                    self[f"{prefix}.{i}.{MESSAGE_CONTENT}"] = str(content)
-                elif is_iterable_of(content, dict):
-                    for j, c in list(enumerate(content)):
-                        for key, value in self._get_attributes_from_message_content(
-                            c,
-                        ):
-                            self[f"{prefix}.{i}.{MESSAGE_CONTENTS}.{j}.{key}"] = value
+            blocks = message.blocks
+            if len(blocks) == 1 and isinstance(blocks[0], TextBlock):
+                self[f"{prefix}.{i}.{MESSAGE_CONTENT}"] = blocks[0].text
+            else:
+                for j, block in enumerate(blocks):
+                    for k, v in _get_attributes_from_content_block(
+                        block,
+                        prefix=f"{prefix}.{i}.{MESSAGE_CONTENTS}.{j}.",
+                    ):
+                        self[k] = v
             additional_kwargs = message.additional_kwargs
             if name := additional_kwargs.get("name"):
                 self[f"{prefix}.{i}.{MESSAGE_NAME}"] = name
@@ -662,6 +827,40 @@ class _Span(BaseSpan):
             yield f"{ImageAttributes.IMAGE_URL}", url
 
 
+def _get_attributes_from_content_block(
+    obj: ContentBlock,
+    prefix: str,
+) -> Iterator[Tuple[str, AttributeValue]]:
+    if isinstance(obj, TextBlock):
+        yield from _get_attributes_from_text_block(obj, prefix=prefix)
+    elif isinstance(obj, ImageBlock):
+        yield from _get_attributes_from_image_block(obj, prefix=prefix)
+
+
+def _get_attributes_from_text_block(
+    obj: TextBlock,
+    prefix: str = "",
+) -> Iterator[Tuple[str, AttributeValue]]:
+    yield f"{prefix}{MESSAGE_CONTENT_TYPE}", "text"
+    yield f"{prefix}{MESSAGE_CONTENT_TEXT}", obj.text
+
+
+def _get_attributes_from_image_block(
+    obj: ImageBlock,
+    prefix: str = "",
+) -> Iterator[Tuple[str, AttributeValue]]:
+    if obj.image and obj.image_mimetype:
+        url = f"data:{obj.image_mimetype};base64,{obj.image.decode()}"
+        yield f"{prefix}{MESSAGE_CONTENT_IMAGE}.{IMAGE_URL}", url
+        yield f"{prefix}{MESSAGE_CONTENT_TYPE}", "image"
+    elif obj.url:
+        yield f"{prefix}{MESSAGE_CONTENT_IMAGE}.{IMAGE_URL}", str(obj.url)
+        yield f"{prefix}{MESSAGE_CONTENT_TYPE}", "image"
+    elif obj.path:
+        yield f"{prefix}{MESSAGE_CONTENT_IMAGE}.{IMAGE_URL}", str(obj.path)
+        yield f"{prefix}{MESSAGE_CONTENT_TYPE}", "image"
+
+
 END_OF_QUEUE = None
 
 
@@ -723,11 +922,24 @@ class _ExportQueue:
 
 class _SpanHandler(BaseSpanHandler[_Span], extra="allow"):
     _otel_tracer: Tracer = PrivateAttr()
+    _separate_trace_from_runtime_context: bool = PrivateAttr()
     _export_queue: _ExportQueue = PrivateAttr()
 
-    def __init__(self, tracer: Tracer) -> None:
+    def __init__(
+        self,
+        tracer: Tracer,
+        separate_trace_from_runtime_context: bool = False,
+    ) -> None:
+        """Initialize the span handler.
+
+        Args:
+            tracer (trace_api.Tracer): The OpenTelemetry tracer for creating spans.
+            separate_trace_from_runtime_context (bool): When True, always start a new trace for each
+                span without a parent, isolating it from any existing trace in the runtime context.
+        """
         super().__init__()
         self._otel_tracer = tracer
+        self._separate_trace_from_runtime_context = separate_trace_from_runtime_context
         self._export_queue = _ExportQueue()
 
     def new_span(
@@ -748,7 +960,11 @@ class _SpanHandler(BaseSpanHandler[_Span], extra="allow"):
             name=id_.partition("-")[0],
             start_time=time_ns(),
             attributes=dict(get_attributes_from_context()),
-            context=(parent.context if parent else None),
+            context=(
+                parent.context
+                if parent
+                else (context_api.Context() if self._separate_trace_from_runtime_context else None)
+            ),
         )
         span = _Span(
             otel_span=otel_span,
@@ -814,9 +1030,9 @@ class _SpanHandler(BaseSpanHandler[_Span], extra="allow"):
 class EventHandler(BaseEventHandler, extra="allow"):
     _span_handler: _SpanHandler = PrivateAttr()
 
-    def __init__(self, tracer: Tracer) -> None:
+    def __init__(self, span_handler: _SpanHandler) -> None:
         super().__init__()
-        self._span_handler = _SpanHandler(tracer=tracer)
+        self._span_handler = span_handler
 
     def handle(self, event: BaseEvent, **kwargs: Any) -> Any:
         if context_api.get_value(_SUPPRESS_INSTRUMENTATION_KEY):
@@ -845,6 +1061,9 @@ def _get_tool_call(tool_call: object) -> Iterator[Tuple[str, Any]]:
             yield TOOL_CALL_ID, tool_call_id
         if name := tool_call.get("name"):
             yield TOOL_CALL_FUNCTION_NAME, name
+        if function := tool_call.get("function"):
+            yield TOOL_CALL_FUNCTION_NAME, function.get("name")
+            yield TOOL_CALL_FUNCTION_ARGUMENTS_JSON, function.get("arguments")
         if arguments := tool_call.get("input"):
             if isinstance(arguments, str):
                 yield TOOL_CALL_FUNCTION_ARGUMENTS_JSON, arguments
@@ -867,39 +1086,110 @@ def _get_token_counts(usage: Union[object, Mapping[str, Any]]) -> Iterator[Tuple
 
 
 def _get_token_counts_from_object(usage: object) -> Iterator[Tuple[str, Any]]:
-    if (prompt_tokens := getattr(usage, "prompt_tokens", None)) is not None:
-        try:
-            yield LLM_TOKEN_COUNT_PROMPT, int(prompt_tokens)
-        except BaseException:
-            pass
-    if (completion_tokens := getattr(usage, "completion_tokens", None)) is not None:
-        try:
-            yield LLM_TOKEN_COUNT_COMPLETION, int(completion_tokens)
-        except BaseException:
-            pass
-    if (total_tokens := getattr(usage, "total_tokens", None)) is not None:
-        try:
-            yield LLM_TOKEN_COUNT_TOTAL, int(total_tokens)
-        except BaseException:
-            pass
+    def get_value(obj: object, key: str) -> Any:
+        return getattr(obj, key, None)
+
+    yield from _get_token_counts_impl(usage, get_value)
 
 
 def _get_token_counts_from_mapping(
     usage_mapping: Mapping[str, Any],
 ) -> Iterator[Tuple[str, Any]]:
-    if (prompt_tokens := usage_mapping.get("prompt_tokens")) is not None:
+    def get_value(obj: Mapping[str, Any], key: str) -> Any:
+        return obj.get(key)
+
+    yield from _get_token_counts_impl(usage_mapping, get_value)
+
+
+def _get_token_counts_impl(
+    usage: Union[object, Mapping[str, Any]], get_value: Callable[[Any, str], Any]
+) -> Iterator[Tuple[str, Any]]:
+    # OpenAI
+    if (prompt_tokens := get_value(usage, "prompt_tokens")) is not None:
         try:
             yield LLM_TOKEN_COUNT_PROMPT, int(prompt_tokens)
         except BaseException:
             pass
-    if (completion_tokens := usage_mapping.get("completion_tokens")) is not None:
+    if (prompt_token_details := get_value(usage, "prompt_tokens_details")) is not None:
+        if (cached_tokens := get_value(prompt_token_details, "cached_tokens")) is not None:
+            try:
+                yield LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ, int(cached_tokens)
+            except BaseException:
+                pass
+        if (audio_tokens := get_value(prompt_token_details, "audio_tokens")) is not None:
+            try:
+                yield LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO, int(audio_tokens)
+            except BaseException:
+                pass
+    if (completion_tokens := get_value(usage, "completion_tokens")) is not None:
         try:
             yield LLM_TOKEN_COUNT_COMPLETION, int(completion_tokens)
         except BaseException:
             pass
-    if (total_tokens := usage_mapping.get("total_tokens")) is not None:
+    if (completion_tokens_details := get_value(usage, "completion_tokens_details")) is not None:
+        if (
+            reasoning_tokens := get_value(completion_tokens_details, "reasoning_tokens")
+        ) is not None:
+            try:
+                yield LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING, int(reasoning_tokens)
+            except BaseException:
+                pass
+        if (
+            completion_audio_tokens := get_value(
+                completion_tokens_details, "audio_tokens" if isinstance(usage, object) else "audio"
+            )
+        ) is not None:
+            try:
+                yield LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO, int(completion_audio_tokens)
+            except BaseException:
+                pass
+    if (total_tokens := get_value(usage, "total_tokens")) is not None:
         try:
             yield LLM_TOKEN_COUNT_TOTAL, int(total_tokens)
+        except BaseException:
+            pass
+
+    # Anthropic
+    if (output_tokens := get_value(usage, "output_tokens")) is not None:
+        try:
+            yield LLM_TOKEN_COUNT_COMPLETION, int(output_tokens)
+        except BaseException:
+            pass
+    if (cache_creation_input_tokens := get_value(usage, "cache_creation_input_tokens")) is not None:
+        try:
+            yield LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE, int(cache_creation_input_tokens)
+        except BaseException:
+            pass
+    if (cache_read_input_tokens := get_value(usage, "cache_read_input_tokens")) is not None:
+        try:
+            yield LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ, int(cache_read_input_tokens)
+        except BaseException:
+            pass
+    if (input_tokens := get_value(usage, "input_tokens")) is not None:
+        try:
+            input_tokens = int(input_tokens)
+            if cache_creation_input_tokens is not None:
+                input_tokens += int(cache_creation_input_tokens)
+            if cache_read_input_tokens is not None:
+                input_tokens += int(cache_read_input_tokens)
+            yield LLM_TOKEN_COUNT_PROMPT, input_tokens
+        except BaseException:
+            pass
+
+    # VertexAI
+    if (prompt_token_count := get_value(usage, "prompt_token_count")) is not None:
+        try:
+            yield LLM_TOKEN_COUNT_PROMPT, int(prompt_token_count)
+        except BaseException:
+            pass
+    if (candidates_token_count := get_value(usage, "candidates_token_count")) is not None:
+        try:
+            yield LLM_TOKEN_COUNT_COMPLETION, int(candidates_token_count)
+        except BaseException:
+            pass
+    if (total_token_count := get_value(usage, "total_token_count")) is not None:
+        try:
+            yield LLM_TOKEN_COUNT_TOTAL, int(total_token_count)
         except BaseException:
             pass
 
@@ -909,14 +1199,19 @@ def _init_span_kind(_: Any) -> Optional[str]:
     return None
 
 
-@_init_span_kind.register
-def _(_: BaseAgent) -> str:
-    return AGENT
+# Only register agent handlers if the classes exist
+if BaseAgent is not None:
+
+    @_init_span_kind.register
+    def _agent_span_kind(_: BaseAgent) -> str:  # type: ignore[misc]
+        return AGENT
 
 
-@_init_span_kind.register
-def _(_: BaseAgentWorker) -> str:
-    return AGENT
+if BaseAgentWorker is not None:
+
+    @_init_span_kind.register
+    def _agent_worker_span_kind(_: BaseAgentWorker) -> str:  # type: ignore[misc]
+        return AGENT
 
 
 @_init_span_kind.register
@@ -1054,9 +1349,22 @@ LLM_OUTPUT_MESSAGES = SpanAttributes.LLM_OUTPUT_MESSAGES
 LLM_PROMPTS = SpanAttributes.LLM_PROMPTS
 LLM_PROMPT_TEMPLATE = SpanAttributes.LLM_PROMPT_TEMPLATE
 LLM_PROMPT_TEMPLATE_VARIABLES = SpanAttributes.LLM_PROMPT_TEMPLATE_VARIABLES
+LLM_PROVIDER = SpanAttributes.LLM_PROVIDER
+LLM_SYSTEM = SpanAttributes.LLM_SYSTEM
 LLM_TOKEN_COUNT_COMPLETION = SpanAttributes.LLM_TOKEN_COUNT_COMPLETION
+LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO = SpanAttributes.LLM_TOKEN_COUNT_COMPLETION_DETAILS_AUDIO
+LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING = (
+    SpanAttributes.LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING
+)
 LLM_TOKEN_COUNT_PROMPT = SpanAttributes.LLM_TOKEN_COUNT_PROMPT
+LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO = SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_AUDIO
+LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ = SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ
+LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE = (
+    SpanAttributes.LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE
+)
+
 LLM_TOKEN_COUNT_TOTAL = SpanAttributes.LLM_TOKEN_COUNT_TOTAL
+LLM_TOOLS = SpanAttributes.LLM_TOOLS
 MESSAGE_CONTENT = MessageAttributes.MESSAGE_CONTENT
 MESSAGE_CONTENTS = MessageAttributes.MESSAGE_CONTENTS
 MESSAGE_CONTENT_TYPE = MessageContentAttributes.MESSAGE_CONTENT_TYPE
@@ -1084,6 +1392,8 @@ TOOL_CALL_FUNCTION_NAME = ToolCallAttributes.TOOL_CALL_FUNCTION_NAME
 TOOL_DESCRIPTION = SpanAttributes.TOOL_DESCRIPTION
 TOOL_NAME = SpanAttributes.TOOL_NAME
 TOOL_PARAMETERS = SpanAttributes.TOOL_PARAMETERS
+
+TOOL_JSON_SCHEMA = ToolAttributes.TOOL_JSON_SCHEMA
 
 JSON = OpenInferenceMimeTypeValues.JSON.value
 

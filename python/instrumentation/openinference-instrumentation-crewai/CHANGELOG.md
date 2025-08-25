@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.1.11](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-crewai-v0.1.10...python-openinference-instrumentation-crewai-v0.1.11) (2025-07-16)
+
+
+### Features
+
+* **crewai:** capture graph.node.id and graph.node.parent_id semantics ([#1794](https://github.com/Arize-ai/openinference/issues/1794)) ([4645932](https://github.com/Arize-ai/openinference/commit/4645932b68f7ed5ab3ecd8818ddad9e1011c027e))
+
+## [0.1.10](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-crewai-v0.1.9...python-openinference-instrumentation-crewai-v0.1.10) (2025-05-27)
+
+
+### Bug Fixes
+
+* **crewai:** crewai default empty tasks ([#1682](https://github.com/Arize-ai/openinference/issues/1682)) ([4a47bfc](https://github.com/Arize-ai/openinference/commit/4a47bfc065b88b55bfcb7605abf66ef12a286ec9))
+
+## [0.1.9](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-crewai-v0.1.8...python-openinference-instrumentation-crewai-v0.1.9) (2025-04-28)
+
+
+### Bug Fixes
+
+* update lower bound on openinference-semantic-conventions ([#1567](https://github.com/Arize-ai/openinference/issues/1567)) ([c2f428c](https://github.com/Arize-ai/openinference/commit/c2f428c5916c3dd62cf6670358f37111d4f7fd25))
+
+## [0.1.8](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-crewai-v0.1.7...python-openinference-instrumentation-crewai-v0.1.8) (2025-04-11)
+
+
+### Bug Fixes
+
+* increased minimum supported version of openinference-instrumentation to 0.1.27 ([#1507](https://github.com/Arize-ai/openinference/issues/1507)) ([a55edfa](https://github.com/Arize-ai/openinference/commit/a55edfa8900c1f36a73385c7d03f91cffadd85c4))
+
+## [0.1.7](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-crewai-v0.1.6...python-openinference-instrumentation-crewai-v0.1.7) (2025-03-14)
+
+
+### Documentation
+
+* fix license to be openinference ([#1353](https://github.com/Arize-ai/openinference/issues/1353)) ([85d435b](https://github.com/Arize-ai/openinference/commit/85d435be3af3de5424494cfbdd654454688b7377))
+
 ## [0.1.6](https://github.com/Arize-ai/openinference/compare/python-openinference-instrumentation-crewai-v0.1.5...python-openinference-instrumentation-crewai-v0.1.6) (2025-02-18)
 
 
